@@ -148,6 +148,8 @@ export interface ProposeTakesOpts extends BasePhaseOpts {
   repoPath?: string;
   /** Limit pages processed in this cycle (for triage / quick smoke). Default: 100. */
   pageLimit?: number;
+  /** Bounded page-level extractor concurrency. Default: 1. */
+  concurrency?: number;
   /** Inject the LLM call for tests; production uses gateway.chat. */
   extractor?: ProposeTakesExtractor;
   /** Override prompt_version (tests). */
@@ -194,25 +196,46 @@ async function listCandidatePages(
   engine: BrainEngine,
   scope: ScopedReadOpts,
   limit: number,
+  promptVersion: string,
 ): Promise<ProposeTakesPageRow[]> {
-  const where = ['deleted_at IS NULL'];
-  const params: unknown[] = [];
+  const where = [
+    'p.deleted_at IS NULL',
+    "octet_length(coalesce(p.compiled_truth, '')) <= 50000",
+    `NOT EXISTS (
+       SELECT 1
+         FROM take_proposals tp
+        WHERE tp.source_id = p.source_id
+          AND tp.page_slug = p.slug
+          AND tp.content_hash = encode(digest(coalesce(p.compiled_truth, ''), 'sha256'), 'hex')
+          AND tp.prompt_version = $1
+     )`,
+  ];
+  const params: unknown[] = [promptVersion];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
     params.push(scope.sourceIds);
-    where.push(`source_id = ANY($${params.length}::text[])`);
+    where.push(`p.source_id = ANY($${params.length}::text[])`);
   } else if (scope.sourceId) {
     params.push(scope.sourceId);
-    where.push(`source_id = $${params.length}`);
+    where.push(`p.source_id = $${params.length}`);
   }
   params.push(limit);
   return engine.executeRaw<ProposeTakesPageRow>(
     `SELECT slug, source_id, compiled_truth
-       FROM pages
+       FROM pages p
       WHERE ${where.join(' AND ')}
-      ORDER BY updated_at DESC, id DESC
+      ORDER BY p.updated_at DESC, p.id DESC
       LIMIT $${params.length}`,
     params,
   );
+}
+
+function positiveIntegerEnv(name: string, fallback: number, maximum: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed >= 1
+    ? Math.min(parsed, maximum)
+    : fallback;
 }
 
 /**
@@ -434,7 +457,13 @@ class ProposeTakesPhase extends BaseCyclePhase {
   ): Promise<{ summary: string; details: Record<string, unknown>; status?: PhaseStatus }> {
     const extractor = opts.extractor ?? defaultExtractor;
     const promptVersion = opts.promptVersion ?? PROPOSE_TAKES_PROMPT_VERSION;
-    const pageLimit = opts.pageLimit ?? 100;
+    const pageLimit = opts.pageLimit
+      ?? positiveIntegerEnv('GBRAIN_PROPOSE_TAKES_PAGE_LIMIT', 100, 100_000);
+    const concurrency = Math.max(1, Math.min(
+      opts.concurrency
+        ?? positiveIntegerEnv('GBRAIN_PROPOSE_TAKES_CONCURRENCY', 1, 256),
+      256,
+    ));
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     const deadlineMs = opts.deadlineMs ?? ProposeTakesPhase.PHASE_DEADLINE_MS;
     const phaseStartMs = Date.now();
@@ -479,146 +508,157 @@ class ProposeTakesPhase extends BaseCyclePhase {
     };
 
     // Load pages eligible for proposal. Source-scoped per BaseCyclePhase.
-    const pages = await listCandidatePages(engine, scope, pageLimit);
+    const pages = await listCandidatePages(engine, scope, pageLimit, promptVersion);
 
     if (opts.reporter) {
       opts.reporter.start('propose_takes.pages' as never, pages.length);
     }
 
-    for (const page of pages) {
-      // Phase deadline check. Break (not throw) so the phase returns a
-      // partial result with deadline_hit:true; work already banked stays.
-      const elapsedMs = Date.now() - phaseStartMs;
-      if (elapsedMs > deadlineMs) {
-        result.warnings.push(
-          `phase deadline hit at page ${result.pages_scanned}/${pages.length} ` +
-          `after ${(elapsedMs / 1000).toFixed(0)}s (cap ${(deadlineMs / 1000).toFixed(0)}s); partial completion`,
+    let nextPageIndex = 0;
+    const processNextPage = async (): Promise<void> => {
+      while (true) {
+        if (result.budget_exhausted || result.deadline_hit) return;
+        const pageIndex = nextPageIndex++;
+        if (pageIndex >= pages.length) return;
+        const page = pages[pageIndex]!;
+
+        // Phase deadline check. Return (not throw) so the phase reports a
+        // partial result with deadline_hit:true; work already banked stays.
+        const elapsedMs = Date.now() - phaseStartMs;
+        if (elapsedMs > deadlineMs) {
+          result.warnings.push(
+            `phase deadline hit at page ${result.pages_scanned}/${pages.length} ` +
+            `after ${(elapsedMs / 1000).toFixed(0)}s (cap ${(deadlineMs / 1000).toFixed(0)}s); partial completion`,
+          );
+          result.deadline_hit = true;
+          return;
+        }
+
+        result.pages_scanned += 1;
+        this.tick(opts);
+
+        // Skip pages that have NO prose body (e.g. metadata-only entity stubs).
+        const body = page.compiled_truth ?? '';
+        if (body.trim().length === 0) continue;
+        if (skipPagesWithFence && hasCompleteFence(body)) continue;
+
+        const ch = contentHash(body);
+        const existingTakes = extractExistingTakesForDedup(body);
+
+        // Idempotency check. If a row exists for (source_id, page_slug, content_hash,
+        // prompt_version), this page was already processed — skip and count as cache hit.
+        const sourceId = page.source_id ?? scope.sourceId ?? 'default';
+        const cached = await engine.executeRaw<{ id: number }>(
+          `SELECT id FROM take_proposals
+           WHERE source_id = $1 AND page_slug = $2 AND content_hash = $3 AND prompt_version = $4
+           LIMIT 1`,
+          [sourceId, page.slug, ch, promptVersion],
         );
-        result.deadline_hit = true;
-        break;
-      }
+        if (cached.length > 0) {
+          result.cache_hits += 1;
+          continue;
+        }
+        result.cache_misses += 1;
 
-      result.pages_scanned += 1;
-      this.tick(opts);
-
-      // Skip pages that have NO prose body (e.g. metadata-only entity stubs).
-      const body = page.compiled_truth ?? '';
-      if (body.trim().length === 0) continue;
-      if (skipPagesWithFence && hasCompleteFence(body)) continue;
-
-      const ch = contentHash(body);
-      const existingTakes = extractExistingTakesForDedup(body);
-
-      // Idempotency check. If a row exists for (source_id, page_slug, content_hash,
-      // prompt_version), this page was already processed — skip and count as cache hit.
-      const sourceId = page.source_id ?? scope.sourceId ?? 'default';
-      const cached = await engine.executeRaw<{ id: number }>(
-        `SELECT id FROM take_proposals
-         WHERE source_id = $1 AND page_slug = $2 AND content_hash = $3 AND prompt_version = $4
-         LIMIT 1`,
-        [sourceId, page.slug, ch, promptVersion],
-      );
-      if (cached.length > 0) {
-        result.cache_hits += 1;
-        continue;
-      }
-      result.cache_misses += 1;
-
-      // Budget pre-check before the LLM call. Estimate: ~1500 input tokens + 500 output.
-      const budget = this.checkBudget({
-        modelId,
-        estimatedInputTokens: 1500,
-        maxOutputTokens: 500,
-      });
-      if (!budget.allowed) {
-        result.budget_exhausted = true;
-        result.warnings.push(
-          `budget exhausted at page ${result.pages_scanned}/${pages.length} (cumulative $${budget.cumulativeCostUsd.toFixed(4)} / cap $${budget.budgetUsd.toFixed(2)})`,
-        );
-        break;
-      }
-
-      // Call the extractor. Errors on a single page log a warning but do not abort.
-      let proposals: ProposedTake[];
-      try {
-        proposals = await extractor({
-          pagePath: page.slug,
-          pageBody: body,
-          existingTakes,
-          modelHint: opts.model,
+        // Budget pre-check before the LLM call. Estimate: ~1500 input tokens + 500 output.
+        const budget = this.checkBudget({
+          modelId,
+          estimatedInputTokens: 1500,
+          maxOutputTokens: 500,
         });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);
-        continue;
-      }
+        if (!budget.allowed) {
+          result.budget_exhausted = true;
+          result.warnings.push(
+            `budget exhausted at page ${result.pages_scanned}/${pages.length} (cumulative $${budget.cumulativeCostUsd.toFixed(4)} / cap $${budget.budgetUsd.toFixed(2)})`,
+          );
+          return;
+        }
 
-      // Write proposals to take_proposals. #2138: the idempotency key is
-      // per-CLAIM — take_proposals_idempotency_idx folds md5(claim_text) into
-      // the per-page tuple (migration v125), so a multi-claim page keeps every
-      // claim. RETURNING id prevents a repeated claim from inflating the count.
-      for (const p of proposals) {
-        const inserted = await engine.executeRaw<{ id: number }>(
-          `INSERT INTO take_proposals
-             (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
-              claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-           ON CONFLICT (source_id, page_slug, content_hash, prompt_version, md5(claim_text)) DO NOTHING
-           RETURNING id`,
-          [
-            sourceId,
-            page.slug,
-            ch,
-            promptVersion,
-            proposalRunId,
-            p.claim_text,
-            p.kind,
-            p.holder,
-            p.weight,
-            p.domain ?? null,
-            JSON.stringify(existingTakes),
-            modelId,
-          ],
-        );
-        result.proposals_inserted += inserted.length;
-      }
+        // Call the extractor. Errors on a single page log a warning but do not abort.
+        let proposals: ProposedTake[];
+        try {
+          proposals = await extractor({
+            pagePath: page.slug,
+            pageBody: body,
+            existingTakes,
+            modelHint: opts.model,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);
+          continue;
+        }
 
-      // Memoize the empty case too. A page that extracted zero claims gets
-      // NO row from the loop above, so without this its idempotency tuple is
-      // never recorded and the next cycle re-spends an LLM call on unchanged
-      // prose (the idle-cost bug). Write one tombstone row keyed by the same
-      // per-page tuple (the cache-hit lookup above matches ANY row for the
-      // 4-tuple; the unique index — take_proposals_idempotency_idx, migration
-      // v125 — folds md5(claim_text) in, so the conflict target must too).
-      // status='rejected' keeps it out of any pending-review query; its sole
-      // purpose is to make the next cycle a cache hit. Only reached on a
-      // SUCCESSFUL empty extract — the extractor-throw path `continue`s above,
-      // so failed pages are retried rather than tombstoned.
-      if (proposals.length === 0) {
-        await engine.executeRaw(
-          `INSERT INTO take_proposals
-             (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
-              claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'rejected')
-           ON CONFLICT (source_id, page_slug, content_hash, prompt_version, md5(claim_text)) DO NOTHING`,
-          [
-            sourceId,
-            page.slug,
-            ch,
-            promptVersion,
-            proposalRunId,
-            EMPTY_EXTRACTION_TOMBSTONE_TEXT,
-            'fact',
-            'brain',
-            0,
-            null,
-            JSON.stringify(existingTakes),
-            modelId,
-          ],
-        );
-        result.tombstones_written += 1;
+        // Write proposals to take_proposals. #2138: the idempotency key is
+        // per-CLAIM — take_proposals_idempotency_idx folds md5(claim_text) into
+        // the per-page tuple (migration v125), so a multi-claim page keeps every
+        // claim. RETURNING id prevents a repeated claim from inflating the count.
+        for (const p of proposals) {
+          const inserted = await engine.executeRaw<{ id: number }>(
+            `INSERT INTO take_proposals
+               (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+                claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             ON CONFLICT (source_id, page_slug, content_hash, prompt_version, md5(claim_text)) DO NOTHING
+             RETURNING id`,
+            [
+              sourceId,
+              page.slug,
+              ch,
+              promptVersion,
+              proposalRunId,
+              p.claim_text,
+              p.kind,
+              p.holder,
+              p.weight,
+              p.domain ?? null,
+              JSON.stringify(existingTakes),
+              modelId,
+            ],
+          );
+          result.proposals_inserted += inserted.length;
+        }
+
+        // Memoize the empty case too. A page that extracted zero claims gets
+        // NO row from the loop above, so without this its idempotency tuple is
+        // never recorded and the next cycle re-spends an LLM call on unchanged
+        // prose (the idle-cost bug). Write one tombstone row keyed by the same
+        // per-page tuple (the cache-hit lookup above matches ANY row for the
+        // 4-tuple; the unique index — take_proposals_idempotency_idx, migration
+        // v125 — folds md5(claim_text) in, so the conflict target must too).
+        // status='rejected' keeps it out of any pending-review query; its sole
+        // purpose is to make the next cycle a cache hit. Only reached on a
+        // SUCCESSFUL empty extract — the extractor-throw path `continue`s above,
+        // so failed pages are retried rather than tombstoned.
+        if (proposals.length === 0) {
+          await engine.executeRaw(
+            `INSERT INTO take_proposals
+               (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+                claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'rejected')
+             ON CONFLICT (source_id, page_slug, content_hash, prompt_version, md5(claim_text)) DO NOTHING`,
+            [
+              sourceId,
+              page.slug,
+              ch,
+              promptVersion,
+              proposalRunId,
+              EMPTY_EXTRACTION_TOMBSTONE_TEXT,
+              'fact',
+              'brain',
+              0,
+              null,
+              JSON.stringify(existingTakes),
+              modelId,
+            ],
+          );
+          result.tombstones_written += 1;
+        }
       }
-    }
+    };
+
+    const workerCount = Math.min(concurrency, Math.max(1, pages.length));
+    await Promise.all(Array.from({ length: workerCount }, () => processNextPage()));
 
     if (opts.reporter) opts.reporter.finish();
 
@@ -655,7 +695,13 @@ class ProposeTakesPhase extends BaseCyclePhase {
 
     return {
       summary: `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals, ${result.tombstones_written} empty (run ${proposalRunId})`,
-      details: { ...result, proposal_run_id: proposalRunId, prompt_version: promptVersion },
+      details: {
+        ...result,
+        proposal_run_id: proposalRunId,
+        prompt_version: promptVersion,
+        concurrency,
+        page_limit: pageLimit,
+      },
       status: result.budget_exhausted || result.deadline_hit ? 'warn' : 'ok',
     };
   }
