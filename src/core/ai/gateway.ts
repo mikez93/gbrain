@@ -96,7 +96,18 @@ const AI_MULTIMODAL_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_MULTIMODAL_TIMEOU
  * shorter caller deadline always takes precedence over the default backstop.
  */
 function withDefaultTimeout(caller: AbortSignal | undefined, timeoutMs: number): AbortSignal {
-  const timeout = AbortSignal.timeout(timeoutMs);
+  // Bun's compiled runtime can keep AbortSignal.timeout()'s internal timer
+  // referenced after a successful request, which strands short-lived CLI
+  // processes (and any locks they own) until the full default timeout elapses.
+  // An unref'ed timer still aborts a genuinely live request, but cannot be the
+  // only reason an otherwise-complete process stays alive.
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new Error(`AI gateway call timed out after ${timeoutMs}ms`)),
+    timeoutMs,
+  );
+  (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  const timeout = controller.signal;
   return caller ? AbortSignal.any([caller, timeout]) : timeout;
 }
 
