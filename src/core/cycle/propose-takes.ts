@@ -292,8 +292,16 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
   return rows;
 }
 
-/** Per-call wall-clock timeout for the extractor LLM call. */
-const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
+/**
+ * Per-call wall-clock timeout for the extractor LLM call.
+ *
+ * Sustained subscription-backed traffic can complete successfully beyond 90s
+ * (live p95 98s, max 108s). Aborting the client at 90s does not cancel the
+ * already-admitted upstream request at the local proxy, so it spends the
+ * inference while discarding the answer. Keep this below the gateway's 300s
+ * default, but above the observed healthy tail.
+ */
+const EXTRACTOR_CALL_TIMEOUT_MS = 180_000;
 
 /**
  * Production extractor — calls gateway.chat with the EXTRACT_TAKES_PROMPT
