@@ -323,12 +323,26 @@ export async function defaultExtractor(
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
-  const result = await gatewayChat({
-    messages: [{ role: 'user', content: prompt }],
-    ...(input.modelHint ? { model: input.modelHint } : {}),
-    maxTokens: 2048,
-    abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
-  });
+  // Bun's AbortSignal.timeout() timer can keep a compiled CLI alive after the
+  // request has already completed, needlessly retaining the source/producer
+  // lock until the timeout expires. Own the timer and clear it as soon as the
+  // gateway call settles.
+  const abortController = new AbortController();
+  const timeout = setTimeout(
+    () => abortController.abort(new Error('propose_takes extractor call timed out')),
+    EXTRACTOR_CALL_TIMEOUT_MS,
+  );
+  let result: Awaited<ReturnType<typeof gatewayChat>>;
+  try {
+    result = await gatewayChat({
+      messages: [{ role: 'user', content: prompt }],
+      ...(input.modelHint ? { model: input.modelHint } : {}),
+      maxTokens: 2048,
+      abortSignal: abortController.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   // ChatResult.text is already the concatenated text content.
   const takes = parseExtractorOutput(result.text);
