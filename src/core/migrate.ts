@@ -5652,6 +5652,21 @@ export const MIGRATIONS: Migration[] = [
         ON session_context_state (updated_at);
     `,
   },
+  {
+    version: 127,
+    name: 'take_proposals_review_audit',
+    // Review-first promotion writes accepted claims into a durable curation
+    // page rather than a replaceable evidence page. Record that canonical
+    // page explicitly, and retain a rejection/review note instead of dropping
+    // the operator's reason at the CLI/MCP boundary.
+    idempotent: true,
+    sql: `
+      ALTER TABLE take_proposals
+        ADD COLUMN IF NOT EXISTS canonical_page_slug TEXT;
+      ALTER TABLE take_proposals
+        ADD COLUMN IF NOT EXISTS review_note TEXT;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

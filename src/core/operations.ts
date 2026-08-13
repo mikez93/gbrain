@@ -33,6 +33,11 @@ export { MEMORY_VERBS_VERSION };
 import type { SearchResult } from './types.ts';
 import { CJK_SLUG_CHARS, PAGE_SLUG_SEG } from './cjk.ts';
 import { ALL_SOURCES } from './source-id.ts';
+import {
+  acceptTakeProposal,
+  listTakeProposals,
+  rejectTakeProposal,
+} from './take-proposals.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
 import {
@@ -2276,6 +2281,65 @@ const takes_search: Operation = {
     });
   },
   cliHints: { name: 'takes-search', positional: ['query'] },
+};
+
+const takes_propose_list: Operation = {
+  name: 'takes_propose_list',
+  description: 'List pending reviewed take proposals before promotion into canonical takes.',
+  scope: 'read',
+  params: {
+    limit: { type: 'number', description: 'Max rows (default 50, cap 500)' },
+    offset: { type: 'number', description: 'Skip first N rows' },
+    status: { type: 'string', description: 'pending | accepted | rejected | superseded (default pending)' },
+  },
+  handler: async (ctx, p) => {
+    // Source isolation + D4 holder privacy: same posture as takes_list /
+    // takes_search — federated grant > scalar source > nothing, and remote
+    // callers only see holders on their allow-list.
+    return listTakeProposals(ctx.engine, {
+      limit: p.limit as number | undefined,
+      offset: p.offset as number | undefined,
+      status: p.status as 'pending' | 'accepted' | 'rejected' | 'superseded' | undefined,
+      ...sourceScopeOpts(ctx),
+      holdersAllowList: ctx.takesHoldersAllowList,
+    });
+  },
+};
+
+const takes_propose_accept: Operation = {
+  name: 'takes_propose_accept',
+  description: 'Accept one reviewed take proposal into a Git-backed durable curation page under its original source, mirror it to DB, and stamp the proposal accepted.',
+  scope: 'write',
+  params: {
+    proposal_id: { type: 'number', required: true },
+  },
+  handler: async (ctx, p) => {
+    return acceptTakeProposal(ctx.engine, p.proposal_id as number, {
+      actedBy: ctx.auth?.clientName ?? 'mcp',
+      // Acceptance is a WRITE. Federated read grants must never expand the
+      // client's scalar write authority to neighboring sources.
+      sourceId: ctx.sourceId,
+      holdersAllowList: ctx.takesHoldersAllowList,
+    });
+  },
+};
+
+const takes_propose_reject: Operation = {
+  name: 'takes_propose_reject',
+  description: 'Reject one take proposal so review-first queues do not re-offer it.',
+  scope: 'write',
+  params: {
+    proposal_id: { type: 'number', required: true },
+    reason: { type: 'string', description: 'Optional review note retained with the rejected proposal.' },
+  },
+  handler: async (ctx, p) => {
+    return rejectTakeProposal(ctx.engine, p.proposal_id as number, {
+      actedBy: ctx.auth?.clientName ?? 'mcp',
+      reason: p.reason as string | undefined,
+      sourceId: ctx.sourceId,
+      holdersAllowList: ctx.takesHoldersAllowList,
+    });
+  },
 };
 
 /**
@@ -6721,7 +6785,7 @@ export const operations: Operation[] = [
   // v0.36.1.0 (T7) — Hindsight calibration wave: read profile via MCP
   get_calibration_profile,
   // v0.28: Takes + think
-  takes_list, takes_search, think,
+  takes_list, takes_search, takes_propose_list, takes_propose_accept, takes_propose_reject, think,
   // v0.30: calibration aggregates over takes
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management

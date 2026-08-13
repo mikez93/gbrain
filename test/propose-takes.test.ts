@@ -629,6 +629,7 @@ New prose appended here.`;
     expect(pageSelect).toBeDefined();
     expect(pageSelect!.sql).toContain('SELECT slug, source_id, compiled_truth');
     expect(pageSelect!.sql).not.toContain('*');
+    expect(pageSelect!.sql).toContain("frontmatter->>'gbrain_curated'");
     // Scalar sourceId scope from ctx binds as a plain equality param.
     expect(pageSelect!.params[0]).toBe('default');
   });

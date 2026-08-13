@@ -195,7 +195,13 @@ async function listCandidatePages(
   scope: ScopedReadOpts,
   limit: number,
 ): Promise<ProposeTakesPageRow[]> {
-  const where = ['deleted_at IS NULL'];
+  const where = [
+    'deleted_at IS NULL',
+    // Accepted proposal ledgers are canonical outputs, not new evidence.
+    // Excluding them prevents the proposal phase from recursively spending
+    // inference on its own reviewed takes and re-proposing accepted claims.
+    `COALESCE(frontmatter->>'gbrain_curated', 'false') <> 'true'`,
+  ];
   const params: unknown[] = [];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
     params.push(scope.sourceIds);

@@ -1309,6 +1309,8 @@ CREATE TABLE IF NOT EXISTS take_proposals (
   acted_at                    TIMESTAMPTZ,
   acted_by                    TEXT,
   promoted_row_num            INTEGER,
+  canonical_page_slug         TEXT,
+  review_note                 TEXT,
   predicted_brier             REAL,
   predicted_brier_bucket_n    INTEGER
 );
