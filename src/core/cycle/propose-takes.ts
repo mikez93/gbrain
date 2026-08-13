@@ -198,6 +198,14 @@ async function listCandidatePages(
   limit: number,
   promptVersion: string,
 ): Promise<ProposeTakesPageRow[]> {
+  const alreadyProcessed = `EXISTS (
+       SELECT 1
+         FROM take_proposals tp
+        WHERE tp.source_id = p.source_id
+          AND tp.page_slug = p.slug
+          AND tp.content_hash = encode(sha256(convert_to(coalesce(p.compiled_truth, ''), 'UTF8')), 'hex')
+          AND tp.prompt_version = $1
+     )`;
   const where = [
     'p.deleted_at IS NULL',
     // Accepted proposal ledgers are canonical outputs, not new evidence.
@@ -205,14 +213,6 @@ async function listCandidatePages(
     // inference on its own reviewed takes and re-proposing accepted claims.
     `COALESCE(p.frontmatter->>'gbrain_curated', 'false') <> 'true'`,
     "octet_length(coalesce(p.compiled_truth, '')) <= 50000",
-    `NOT EXISTS (
-       SELECT 1
-         FROM take_proposals tp
-        WHERE tp.source_id = p.source_id
-          AND tp.page_slug = p.slug
-          AND tp.content_hash = encode(digest(coalesce(p.compiled_truth, ''), 'sha256'), 'hex')
-          AND tp.prompt_version = $1
-     )`,
   ];
   const params: unknown[] = [promptVersion];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
@@ -227,7 +227,10 @@ async function listCandidatePages(
     `SELECT slug, source_id, compiled_truth
        FROM pages p
       WHERE ${where.join(' AND ')}
-      ORDER BY p.updated_at DESC, p.id DESC
+      -- Unprocessed pages come first so a page limit cannot starve the tail
+      -- behind a permanently cached newest-page prefix. Cached rows fill any
+      -- remaining capacity, preserving truthful cache-hit accounting.
+      ORDER BY ${alreadyProcessed} ASC, p.updated_at DESC, p.id DESC
       LIMIT $${params.length}`,
     params,
   );
@@ -495,7 +498,18 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const phaseStartMs = Date.now();
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
-    const modelId = opts.model ?? getChatModel();
+    // An injected extractor is a complete replacement for the gateway path
+    // (tests and offline operators rely on that contract). Do not touch the
+    // process-global gateway merely to manufacture a model label.
+    let modelId = opts.model;
+    if (!modelId) {
+      try {
+        modelId = getChatModel();
+      } catch (error) {
+        if (!opts.extractor) throw error;
+        modelId = 'injected-extractor';
+      }
+    }
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /

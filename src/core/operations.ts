@@ -2308,7 +2308,7 @@ const takes_propose_list: Operation = {
 
 const takes_propose_accept: Operation = {
   name: 'takes_propose_accept',
-  description: 'Accept one reviewed take proposal into a Git-backed durable curation page under its original source, mirror it to DB, and stamp the proposal accepted.',
+  description: 'Accept one reviewed take proposal into the brain-private durable curation ledger, mirror it to DB, and stamp the proposal accepted.',
   scope: 'write',
   params: {
     proposal_id: { type: 'number', required: true },

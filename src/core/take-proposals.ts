@@ -1,5 +1,5 @@
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync,
   realpathSync, writeFileSync,
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
@@ -9,6 +9,7 @@ import type { BrainEngine, TakeKind } from './engine.ts';
 import { parseMarkdown, serializeMarkdown } from './markdown.ts';
 import { parseTakesFence, upsertTakeRow } from './takes-fence.ts';
 import { withPageLock } from './page-lock.ts';
+import { ensureGbrainHome } from './gbrain-home.ts';
 
 /**
  * Caller scope for the proposal review surface. Mirrors `sourceScopeOpts`
@@ -41,6 +42,24 @@ function assertProposalInScope(
   if (scope.holdersAllowList && !scope.holdersAllowList.includes(String(row.holder))) {
     throw new Error(`take proposal ${proposalId} is outside your holder allow-list`);
   }
+}
+
+/**
+ * Proposal acceptance/rejection changes canonical knowledge. Unlike reads,
+ * those writes must always name exactly one source. A federated read grant is
+ * deliberately insufficient: callers must hold scalar write authority for
+ * the proposal's source, and a future caller that forgets to thread scope
+ * fails closed instead of gaining whole-brain write access.
+ */
+function assertProposalWriteScope(
+  row: Record<string, unknown>,
+  scope: ProposalScope,
+  proposalId: number,
+): void {
+  if (!scope.sourceId || (scope.sourceIds && scope.sourceIds.length > 0)) {
+    throw new Error(`take proposal ${proposalId} write requires one explicit source scope`);
+  }
+  assertProposalInScope(row, { sourceId: scope.sourceId, holdersAllowList: scope.holdersAllowList }, proposalId);
 }
 
 const PROPOSAL_STATUSES = ['pending', 'accepted', 'rejected', 'superseded'] as const;
@@ -215,47 +234,126 @@ function curationPath(repoPath: string, slug: string): { path: string; relativeP
   const root = resolve(repoPath);
   const resolved = resolve(path);
   if (!resolved.startsWith(root + sep)) {
-    throw new Error('curation page resolves outside the source repository');
+    throw new Error('curation page resolves outside the curation ledger');
   }
   const relativePath = relative(root, resolved);
   if (!relativePath || isAbsolute(relativePath) || relativePath.startsWith(`..${sep}`)) {
-    throw new Error('curation page has an invalid source-relative path');
+    throw new Error('curation page has an invalid ledger-relative path');
   }
   return { path: resolved, relativePath };
 }
 
-interface SourceRepoPaths {
-  sourceRoot: string;
-  gitRoot: string;
+interface CurationLedgerPaths {
+  worktree: string;
+  mirror: string;
 }
 
-function assertSourceRepo(repoPath: string): SourceRepoPaths {
-  const configuredRoot = resolve(repoPath);
-  if (!existsSync(configuredRoot)) {
-    throw new Error('proposal source repository is unavailable or unsafe');
+function assertSafeDirectory(path: string, label: string): string {
+  const resolved = resolve(path);
+  if (!existsSync(resolved)) {
+    throw new Error(`${label} is unavailable or unsafe`);
   }
-  const metadata = lstatSync(configuredRoot);
+  const metadata = lstatSync(resolved);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new Error('proposal source repository is unavailable or unsafe');
+    throw new Error(`${label} is unavailable or unsafe`);
   }
-  // Git canonicalizes macOS's /var -> /private/var alias. Canonicalize the
-  // configured path too before comparing containment or a valid temp/source
-  // repository can look as though it sits outside its own worktree.
-  const sourceRoot = realpathSync(configuredRoot);
-  git(sourceRoot, ['rev-parse', '--verify', 'HEAD']);
-  const gitRoot = realpathSync(git(sourceRoot, ['rev-parse', '--show-toplevel']));
-  const gitMetadata = lstatSync(gitRoot);
-  const sourceFromGit = relative(gitRoot, sourceRoot);
-  if (
-    !gitMetadata.isDirectory()
-    || gitMetadata.isSymbolicLink()
-    || isAbsolute(sourceFromGit)
-    || sourceFromGit.startsWith(`..${sep}`)
-    || sourceFromGit === '..'
-  ) {
-    throw new Error('proposal source local_path is outside its Git repository');
+  return realpathSync(resolved);
+}
+
+function gitMaybe(repoPath: string, args: string[]): string | null {
+  try {
+    return git(repoPath, args);
+  } catch {
+    return null;
   }
-  return { sourceRoot, gitRoot };
+}
+
+function initBareMirror(path: string): string {
+  if (!existsSync(path)) {
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+    execFileSync('git', ['init', '--bare', '--quiet', '--initial-branch=main', path], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30_000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+  }
+  const mirror = assertSafeDirectory(path, 'brain curation mirror');
+  const bare = gitMaybe(mirror, ['rev-parse', '--is-bare-repository']);
+  if (bare !== 'true') throw new Error('brain curation mirror is not a bare Git repository');
+  try { chmodSync(mirror, 0o700); } catch { /* best effort */ }
+  return mirror;
+}
+
+function initLedgerWorktree(path: string, mirror: string): string {
+  if (!existsSync(path)) {
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+    execFileSync('git', ['init', '--quiet', '--initial-branch=main', path], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30_000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+  }
+  const worktree = assertSafeDirectory(path, 'brain curation ledger');
+  const gitDir = join(worktree, '.git');
+  if (!existsSync(gitDir)) throw new Error('brain curation ledger is not a Git repository');
+  const gitMetadata = lstatSync(gitDir);
+  if (!gitMetadata.isDirectory() || gitMetadata.isSymbolicLink()) {
+    throw new Error('brain curation ledger Git metadata is unavailable or unsafe');
+  }
+  const top = realpathSync(git(worktree, ['rev-parse', '--show-toplevel']));
+  if (top !== worktree) throw new Error('brain curation ledger must be its own Git worktree');
+  const branch = gitMaybe(worktree, ['symbolic-ref', '--short', 'HEAD']);
+  if (branch !== 'main') throw new Error('brain curation ledger must remain on branch main');
+  git(worktree, ['config', 'user.name', 'GBrain Curation']);
+  git(worktree, ['config', 'user.email', 'gbrain-curation@localhost']);
+  const origin = gitMaybe(worktree, ['remote', 'get-url', 'origin']);
+  if (origin === null) git(worktree, ['remote', 'add', 'origin', mirror]);
+  else if (resolve(worktree, origin) !== mirror && resolve(origin) !== mirror) {
+    throw new Error('brain curation ledger origin does not match its private mirror');
+  }
+  try { chmodSync(worktree, 0o700); } catch { /* best effort */ }
+  return worktree;
+}
+
+function syncLedger(worktree: string, mirror: string): void {
+  const dirty = git(worktree, ['status', '--porcelain=v1', '--untracked-files=all']);
+  if (dirty) throw new Error('brain curation ledger has unexpected uncommitted changes');
+
+  git(worktree, ['fetch', '--quiet', 'origin']);
+  const local = gitMaybe(worktree, ['rev-parse', '--verify', 'HEAD']);
+  const remote = gitMaybe(mirror, ['rev-parse', '--verify', 'refs/heads/main']);
+  if (local === null && remote === null) return;
+  if (local === null && remote !== null) {
+    git(worktree, ['checkout', '--quiet', '-B', 'main', remote]);
+    return;
+  }
+  if (local !== null && remote === null) {
+    git(worktree, ['push', '--quiet', 'origin', 'HEAD:refs/heads/main']);
+    return;
+  }
+  if (local === remote) return;
+
+  const base = gitMaybe(worktree, ['merge-base', local!, remote!]);
+  if (base === local) {
+    git(worktree, ['merge', '--quiet', '--ff-only', remote!]);
+    return;
+  }
+  if (base === remote) {
+    git(worktree, ['push', '--quiet', 'origin', 'HEAD:refs/heads/main']);
+    return;
+  }
+  throw new Error('brain curation ledger diverged from its private mirror');
+}
+
+function resolveCurationLedger(explicitPath?: string): CurationLedgerPaths {
+  const worktreePath = explicitPath
+    ? resolve(explicitPath)
+    : join(ensureGbrainHome(), 'curation-ledger');
+  const mirrorPath = `${worktreePath}.git`;
+  const mirror = initBareMirror(mirrorPath);
+  const worktree = initLedgerWorktree(worktreePath, mirror);
+  syncLedger(worktree, mirror);
+  return { worktree, mirror };
 }
 
 function committedBody(repoPath: string, relativePath: string): string | null {
@@ -279,6 +377,7 @@ function committedBody(repoPath: string, relativePath: string): string | null {
  */
 function commitCurationPage(
   repoPath: string,
+  mirrorPath: string,
   path: string,
   relativePath: string,
   body: string,
@@ -288,7 +387,13 @@ function commitCurationPage(
   if (status) {
     throw new Error(`curation path is already dirty: ${relativePath}`);
   }
-  if (committedBody(repoPath, relativePath) === body) return;
+  if (committedBody(repoPath, relativePath) === body) {
+    git(repoPath, ['push', '--quiet', 'origin', 'HEAD:refs/heads/main']);
+    const local = git(repoPath, ['rev-parse', 'HEAD']);
+    const mirrored = git(mirrorPath, ['rev-parse', 'refs/heads/main']);
+    if (local !== mirrored) throw new Error('brain curation mirror did not retain the committed page');
+    return;
+  }
 
   const original = existsSync(path) ? readFileSync(path, 'utf8') : null;
   const tempPath = `${path}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
@@ -301,11 +406,17 @@ function commitCurationPage(
     if (committedBody(repoPath, relativePath) !== body) {
       throw new Error('Git commit did not preserve the exact curation page');
     }
+    git(repoPath, ['push', '--quiet', 'origin', 'HEAD:refs/heads/main']);
+    const local = git(repoPath, ['rev-parse', 'HEAD']);
+    const mirrored = git(mirrorPath, ['rev-parse', 'refs/heads/main']);
+    if (local !== mirrored) throw new Error('brain curation mirror did not retain the committed page');
   } catch (error) {
     // A post-commit hook can fail after Git has already advanced HEAD. If the
     // exact canonical bytes are present there, durability succeeded; do not
     // manufacture a dirty rollback against the new commit.
-    if (committedBody(repoPath, relativePath) === body) return;
+    if (committedBody(repoPath, relativePath) === body) {
+      throw new Error(`proposal ${proposalId} is committed locally but its private mirror is not current: ${error instanceof Error ? error.message : String(error)}`);
+    }
     try { git(repoPath, ['reset', '--quiet', 'HEAD', '--', relativePath]); } catch { /* preserve original error */ }
     if (original === null) {
       try { if (existsSync(path)) unlinkSync(path); } catch { /* preserve original error */ }
@@ -318,6 +429,140 @@ function commitCurationPage(
   }
 }
 
+async function mirrorCanonicalCurationToDb(
+  engine: BrainEngine,
+  proposalId: number,
+  target: ProposalTargetRow,
+  opts: ProposalScope,
+  actedBy: string,
+  curationSlug: string,
+  relativePath: string,
+  canonicalMarkdown: string,
+  rowNum: number,
+  provenance: string,
+): Promise<TakeProposalAcceptResult> {
+  const canonical = parseMarkdown(canonicalMarkdown, relativePath, {
+    validate: true,
+    expectedSlug: curationSlug,
+  });
+  if (canonical.errors && canonical.errors.length > 0) {
+    throw new Error(`committed curation page is invalid: ${canonical.errors.map(error => error.code).join(', ')}`);
+  }
+  assertCurationFrontmatter(canonical.frontmatter, target.source_id, target.content_hash);
+  const canonicalTake = parseTakesFence(canonical.compiled_truth).takes.find(
+    row => row.rowNum === rowNum && row.source === provenance,
+  );
+  if (!canonicalTake || canonicalTake.claim !== target.claim_text) {
+    throw new Error(`committed curation page lost proposal ${proposalId}`);
+  }
+
+  return engine.transaction(async (tx) => {
+    const lockedRows = await tx.executeRaw<Record<string, unknown>>(
+      `SELECT id, source_id, page_slug, content_hash, claim_text, kind,
+              holder, weight, status, promoted_row_num
+         FROM take_proposals
+        WHERE id = $1
+        FOR UPDATE`,
+      [proposalId],
+    );
+    const locked = lockedRows[0];
+    if (!locked) throw new Error(`take proposal not found: ${proposalId}`);
+    assertProposalWriteScope(locked, opts, proposalId);
+    if (
+      String(locked.source_id) !== target.source_id
+      || String(locked.content_hash) !== target.content_hash
+      || String(locked.claim_text) !== canonicalTake.claim
+    ) {
+      throw new Error(`take proposal ${proposalId} changed before its DB index was stamped`);
+    }
+    const promotedRowNum = numberOrNull(locked.promoted_row_num);
+    const alreadyAccepted = locked.status === 'accepted' && promotedRowNum === rowNum;
+    if (!alreadyAccepted && locked.status !== 'pending') {
+      throw new Error(`take proposal ${proposalId} is ${locked.status}; only pending proposals can be accepted`);
+    }
+    if (locked.status === 'accepted' && promotedRowNum !== rowNum) {
+      throw new Error(`take proposal ${proposalId} points at an unexpected canonical row`);
+    }
+
+    const page = await tx.putPage(curationSlug, {
+      type: canonical.type,
+      title: canonical.title,
+      compiled_truth: canonical.compiled_truth,
+      timeline: canonical.timeline,
+      frontmatter: canonical.frontmatter,
+    }, { sourceId: target.source_id });
+
+    const duplicates = await tx.executeRaw<{
+      page_slug: string;
+      row_num: number;
+      source: string | null;
+    }>(
+      `SELECT p.slug AS page_slug, t.row_num, t.source
+         FROM takes t
+         JOIN pages p ON p.id = t.page_id
+        WHERE p.source_id = $1
+          AND t.active = true
+          AND lower(trim(t.claim)) = lower(trim($2))
+          AND NOT (
+            p.slug = $3
+            AND t.row_num = $4
+            AND t.source = $5
+          )
+        ORDER BY t.id
+        LIMIT 1`,
+      [target.source_id, canonicalTake.claim, curationSlug, rowNum, provenance],
+    );
+    const duplicate = duplicates[0];
+    if (duplicate) {
+      throw new Error(
+        `take proposal ${proposalId} duplicates existing take ${duplicate.page_slug}#${duplicate.row_num}`,
+      );
+    }
+
+    await tx.addTakesBatch([{
+      page_id: page.id,
+      row_num: rowNum,
+      claim: canonicalTake.claim,
+      kind: canonicalTake.kind,
+      holder: canonicalTake.holder,
+      weight: canonicalTake.weight,
+      since_date: canonicalTake.sinceDate,
+      source: provenance,
+      active: true,
+      superseded_by: null,
+    }]);
+
+    if (!alreadyAccepted) {
+      const stamped = await tx.executeRaw<{ promoted_row_num: number }>(
+        `UPDATE take_proposals
+            SET status = 'accepted',
+                acted_at = now(),
+                acted_by = $2,
+                promoted_row_num = $3,
+                canonical_page_slug = $4,
+                review_note = NULL
+          WHERE id = $1 AND status = 'pending'
+          RETURNING promoted_row_num`,
+        [proposalId, actedBy, rowNum, curationSlug],
+      );
+      if (stamped.length === 0) {
+        throw new Error(`take proposal ${proposalId} was not stamped accepted`);
+      }
+    }
+
+    return {
+      ok: true,
+      proposal_id: proposalId,
+      source_page_slug: target.page_slug,
+      page_slug: curationSlug,
+      row_num: rowNum,
+      status: 'accepted',
+      idempotent: alreadyAccepted,
+      since_date: canonicalTake.sinceDate,
+    } satisfies TakeProposalAcceptResult;
+  });
+}
+
 interface ProposalTargetRow {
   page_slug: string;
   source_id: string;
@@ -326,7 +571,6 @@ interface ProposalTargetRow {
   holder: string;
   status: string;
   promoted_row_num: number | null;
-  local_path: string | null;
   effective_date: unknown;
   effective_date_source: unknown;
 }
@@ -335,10 +579,9 @@ async function lookupProposalTarget(engine: BrainEngine, proposalId: number): Pr
   const rows = await engine.executeRaw<ProposalTargetRow>(
     `SELECT tp.page_slug, tp.source_id, tp.content_hash, tp.claim_text,
             tp.holder, tp.status,
-            tp.promoted_row_num, s.local_path,
+            tp.promoted_row_num,
             p.effective_date, p.effective_date_source
        FROM take_proposals tp
-       JOIN sources s ON s.id = tp.source_id
        LEFT JOIN pages p ON p.slug = tp.page_slug AND p.source_id = tp.source_id
       WHERE tp.id = $1
       LIMIT 1`,
@@ -401,13 +644,10 @@ export async function listTakeProposals(
 export async function acceptTakeProposal(
   engine: BrainEngine,
   proposalId: number,
-  opts: { actedBy?: string } & ProposalScope = {},
+  opts: { actedBy?: string; curationLedgerPath?: string } & ProposalScope = {},
 ): Promise<TakeProposalAcceptResult> {
   const target = await lookupProposalTarget(engine, proposalId);
-  assertProposalInScope(target as unknown as Record<string, unknown>, opts, proposalId);
-  if (!target.local_path) {
-    throw new Error(`source ${target.source_id} has no local_path; canonical proposal acceptance requires a Git-backed source`);
-  }
+  assertProposalWriteScope(target as unknown as Record<string, unknown>, opts, proposalId);
   if (!/^[a-f0-9]{64}$/i.test(target.content_hash)) {
     throw new Error(`take proposal ${proposalId} has an invalid content hash`);
   }
@@ -423,14 +663,15 @@ export async function acceptTakeProposal(
     target.content_hash,
   );
 
-  return withPageLock(claimLock, () => withPageLock(curationSlug, async () => {
-    const sourceRepo = assertSourceRepo(target.local_path!);
-    const sourcePath = curationPath(sourceRepo.sourceRoot, curationSlug);
-    const relativePath = relative(sourceRepo.gitRoot, sourcePath.path);
+  return withPageLock('take-proposal-curation-ledger', () =>
+    withPageLock(claimLock, () => withPageLock(curationSlug, async () => {
+    const ledger = resolveCurationLedger(opts.curationLedgerPath);
+    const sourcePath = curationPath(ledger.worktree, curationSlug);
+    const relativePath = relative(ledger.worktree, sourcePath.path);
     if (!relativePath || isAbsolute(relativePath) || relativePath.startsWith(`..${sep}`)) {
-      throw new Error('curation page resolves outside the source Git repository');
+      throw new Error('curation page resolves outside the brain curation ledger');
     }
-    const originalMarkdown = committedBody(sourceRepo.gitRoot, relativePath);
+    const originalMarkdown = committedBody(ledger.worktree, relativePath);
 
     let frontmatter: Record<string, unknown>;
     let compiledTruth: string;
@@ -465,7 +706,7 @@ export async function acceptTakeProposal(
     );
     const proposal = proposalRows[0];
     if (!proposal) throw new Error(`take proposal not found: ${proposalId}`);
-    assertProposalInScope(proposal, opts, proposalId);
+    assertProposalWriteScope(proposal, opts, proposalId);
     if (
       String(proposal.source_id) !== target.source_id
       || String(proposal.content_hash) !== target.content_hash
@@ -534,136 +775,104 @@ export async function acceptTakeProposal(
       title,
       tags,
     });
-    commitCurationPage(sourceRepo.gitRoot, sourcePath.path, relativePath, markdown, proposalId);
+    commitCurationPage(
+      ledger.worktree,
+      ledger.mirror,
+      sourcePath.path,
+      relativePath,
+      markdown,
+      proposalId,
+    );
 
     // Re-parse what Git actually committed. This is the canonical input to the
     // derived DB page/take rows; never index a pre-commit in-memory variant.
-    const canonicalMarkdown = committedBody(sourceRepo.gitRoot, relativePath);
+    const canonicalMarkdown = committedBody(ledger.worktree, relativePath);
     if (canonicalMarkdown === null) {
       throw new Error(`proposal ${proposalId} curation page is not committed`);
     }
-    const canonical = parseMarkdown(canonicalMarkdown, relativePath, {
-      validate: true,
-      expectedSlug: curationSlug,
-    });
-    if (canonical.errors && canonical.errors.length > 0) {
-      throw new Error(`committed curation page is invalid: ${canonical.errors.map(error => error.code).join(', ')}`);
-    }
-    assertCurationFrontmatter(canonical.frontmatter, target.source_id, target.content_hash);
-    const canonicalTake = parseTakesFence(canonical.compiled_truth).takes.find(
-      row => row.rowNum === rowNum && row.source === provenance,
+    return mirrorCanonicalCurationToDb(
+      engine,
+      proposalId,
+      target,
+      opts,
+      actedBy,
+      curationSlug,
+      relativePath,
+      canonicalMarkdown,
+      rowNum,
+      provenance,
     );
-    if (!canonicalTake || canonicalTake.claim !== String(proposal.claim_text)) {
-      throw new Error(`committed curation page lost proposal ${proposalId}`);
-    }
+    })));
+}
 
-    return engine.transaction(async (tx) => {
-      const lockedRows = await tx.executeRaw<Record<string, unknown>>(
-        `SELECT id, source_id, page_slug, content_hash, claim_text, kind,
-                holder, weight, status, promoted_row_num
-           FROM take_proposals
-          WHERE id = $1
-          FOR UPDATE`,
-        [proposalId],
+export interface TakeProposalRepairResult {
+  scanned: number;
+  repaired: number;
+  failed: Array<{ proposal_id: number; error: string }>;
+}
+
+/**
+ * Rebuild derived DB pages/takes for accepted proposals from the private Git
+ * ledger. Safe to run at startup or after recovery: no inference, no source
+ * writes, and idempotent when the mirror is already current.
+ */
+export async function repairAcceptedTakeProposals(
+  engine: BrainEngine,
+  opts: { actedBy?: string; curationLedgerPath?: string } & ProposalScope,
+): Promise<TakeProposalRepairResult> {
+  if (!opts.sourceId || (opts.sourceIds && opts.sourceIds.length > 0)) {
+    throw new Error('accepted proposal repair requires one explicit source scope');
+  }
+  const ledger = resolveCurationLedger(opts.curationLedgerPath);
+  const rows = await engine.executeRaw<ProposalTargetRow & { id: number; canonical_page_slug: string }>(
+    `SELECT tp.id, tp.page_slug, tp.source_id, tp.content_hash, tp.claim_text,
+            tp.holder, tp.status, tp.promoted_row_num, tp.canonical_page_slug,
+            p.effective_date, p.effective_date_source
+       FROM take_proposals tp
+       LEFT JOIN pages p ON p.slug = tp.page_slug AND p.source_id = tp.source_id
+      WHERE tp.status = 'accepted'
+        AND tp.source_id = $1
+        AND tp.promoted_row_num IS NOT NULL
+        AND tp.canonical_page_slug IS NOT NULL
+      ORDER BY tp.id`,
+    [opts.sourceId],
+  );
+  const result: TakeProposalRepairResult = { scanned: rows.length, repaired: 0, failed: [] };
+  for (const row of rows) {
+    const proposalId = Number(row.id);
+    try {
+      assertProposalWriteScope(row as unknown as Record<string, unknown>, opts, proposalId);
+      const expectedSlug = proposalCurationSlug(row.source_id, row.content_hash);
+      if (row.canonical_page_slug !== expectedSlug) {
+        throw new Error(`proposal ${proposalId} canonical slug does not match its content identity`);
+      }
+      const sourcePath = curationPath(ledger.worktree, expectedSlug);
+      const relativePath = relative(ledger.worktree, sourcePath.path);
+      const canonicalMarkdown = committedBody(ledger.worktree, relativePath);
+      if (canonicalMarkdown === null) {
+        throw new Error(`proposal ${proposalId} is accepted but missing from the private curation ledger`);
+      }
+      await mirrorCanonicalCurationToDb(
+        engine,
+        proposalId,
+        row,
+        opts,
+        opts.actedBy ?? 'gbrain-repair',
+        expectedSlug,
+        relativePath,
+        canonicalMarkdown,
+        Number(row.promoted_row_num),
+        proposalFenceSource(proposalId, row.source_id, row.page_slug, row.content_hash),
       );
-      const locked = lockedRows[0];
-      if (!locked) throw new Error(`take proposal not found: ${proposalId}`);
-      assertProposalInScope(locked, opts, proposalId);
-      if (
-        String(locked.source_id) !== target.source_id
-        || String(locked.content_hash) !== target.content_hash
-        || String(locked.claim_text) !== canonicalTake.claim
-      ) {
-        throw new Error(`take proposal ${proposalId} changed before its DB index was stamped`);
-      }
-      const promotedRowNum = numberOrNull(locked.promoted_row_num);
-      const alreadyAccepted = locked.status === 'accepted' && promotedRowNum === rowNum;
-      if (!alreadyAccepted && locked.status !== 'pending') {
-        throw new Error(`take proposal ${proposalId} is ${locked.status}; only pending proposals can be accepted`);
-      }
-      if (locked.status === 'accepted' && promotedRowNum !== rowNum) {
-        throw new Error(`take proposal ${proposalId} points at an unexpected canonical row`);
-      }
-
-      const page = await tx.putPage(curationSlug, {
-        type: canonical.type,
-        title: canonical.title,
-        compiled_truth: canonical.compiled_truth,
-        timeline: canonical.timeline,
-        frontmatter: canonical.frontmatter,
-        source_path: relativePath,
-      }, { sourceId: target.source_id });
-
-      const duplicates = await tx.executeRaw<{
-        page_slug: string;
-        row_num: number;
-        source: string | null;
-      }>(
-        `SELECT p.slug AS page_slug, t.row_num, t.source
-           FROM takes t
-           JOIN pages p ON p.id = t.page_id
-          WHERE p.source_id = $1
-            AND t.active = true
-            AND lower(trim(t.claim)) = lower(trim($2))
-            AND NOT (
-              p.slug = $3
-              AND t.row_num = $4
-              AND t.source = $5
-            )
-          ORDER BY t.id
-          LIMIT 1`,
-        [target.source_id, canonicalTake.claim, curationSlug, rowNum, provenance],
-      );
-      const duplicate = duplicates[0];
-      if (duplicate) {
-        throw new Error(
-          `take proposal ${proposalId} duplicates existing take ${duplicate.page_slug}#${duplicate.row_num}`,
-        );
-      }
-
-      await tx.addTakesBatch([{
-        page_id: page.id,
-        row_num: rowNum,
-        claim: canonicalTake.claim,
-        kind: canonicalTake.kind,
-        holder: canonicalTake.holder,
-        weight: canonicalTake.weight,
-        since_date: canonicalTake.sinceDate,
-        source: provenance,
-        active: true,
-        superseded_by: null,
-      }]);
-
-      if (!alreadyAccepted) {
-        const stamped = await tx.executeRaw<{ promoted_row_num: number }>(
-          `UPDATE take_proposals
-              SET status = 'accepted',
-                  acted_at = now(),
-                  acted_by = $2,
-                  promoted_row_num = $3,
-                  canonical_page_slug = $4,
-                  review_note = NULL
-            WHERE id = $1 AND status = 'pending'
-            RETURNING promoted_row_num`,
-          [proposalId, actedBy, rowNum, curationSlug],
-        );
-        if (stamped.length === 0) {
-          throw new Error(`take proposal ${proposalId} was not stamped accepted`);
-        }
-      }
-
-      return {
-        ok: true,
+      result.repaired++;
+    } catch (error) {
+      result.failed.push({
         proposal_id: proposalId,
-        source_page_slug: target.page_slug,
-        page_slug: curationSlug,
-        row_num: rowNum,
-        status: 'accepted',
-        idempotent: alreadyAccepted,
-        since_date: canonicalTake.sinceDate,
-      } satisfies TakeProposalAcceptResult;
-    });
-  }));
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return result;
 }
 
 export async function rejectTakeProposal(
@@ -681,7 +890,7 @@ export async function rejectTakeProposal(
     );
     const row = rows[0];
     if (!row) throw new Error(`take proposal not found: ${proposalId}`);
-    assertProposalInScope(row, opts, proposalId);
+    assertProposalWriteScope(row, opts, proposalId);
     if (row.status === 'rejected') {
       return { ok: true, proposal_id: proposalId, status: 'rejected', idempotent: true, reason: opts.reason };
     }

@@ -34,6 +34,7 @@ import { resolveOwnerHolder } from '../core/owner-holder.ts';
 import {
   acceptTakeProposal,
   listTakeProposals,
+  repairAcceptedTakeProposals,
   rejectTakeProposal,
 } from '../core/take-proposals.ts';
 
@@ -229,14 +230,34 @@ async function cmdPropose(engine: BrainEngine, args: string[]): Promise<void> {
     return;
   }
 
+  if (sub === 'repair') {
+    const sourceId = await resolveTakesSourceId(engine);
+    const result = await repairAcceptedTakeProposals(engine, {
+      actedBy: flagValue(rest, '--by') ?? 'gbrain-cli-repair',
+      sourceId,
+    });
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(
+      `Reconciled ${result.repaired}/${result.scanned} accepted proposal(s) from the private curation ledger` +
+      (result.failed.length > 0 ? `; ${result.failed.length} failed.` : '.'),
+    );
+    if (result.failed.length > 0) process.exitCode = 1;
+    return;
+  }
+
   if (sub === 'accept') {
     const id = parseInt(rest[0] ?? flagValue(rest, '--id') ?? '', 10);
     if (!Number.isFinite(id)) {
       console.error('Usage: gbrain takes propose accept <proposal_id> [--by <actor>] [--json]');
       process.exit(1);
     }
+    const sourceId = await resolveTakesSourceId(engine);
     const result = await acceptTakeProposal(engine, id, {
       actedBy: flagValue(rest, '--by') ?? 'gbrain-cli',
+      sourceId,
     });
     if (json) {
       console.log(JSON.stringify(result, null, 2));
@@ -254,9 +275,11 @@ async function cmdPropose(engine: BrainEngine, args: string[]): Promise<void> {
       console.error('Usage: gbrain takes propose reject <proposal_id> [--reason "..."] [--by <actor>] [--json]');
       process.exit(1);
     }
+    const sourceId = await resolveTakesSourceId(engine);
     const result = await rejectTakeProposal(engine, id, {
       actedBy: flagValue(rest, '--by') ?? 'gbrain-cli',
       reason: flagValue(rest, '--reason'),
+      sourceId,
     });
     if (json) {
       console.log(JSON.stringify(result, null, 2));
@@ -648,9 +671,11 @@ Subcommands:
   takes propose list [--status pending] [--limit N] [--offset N] [--json]
                                           Review pending take proposals
   takes propose accept <proposal_id> [--by <actor>] [--json]
-                                          Promote a reviewed proposal into its source's durable curation ledger
+                                          Promote a reviewed proposal into the brain-private durable curation ledger
   takes propose reject <proposal_id> [--reason "..."] [--by <actor>] [--json]
                                           Reject a proposal so it is not re-proposed
+  takes propose repair [--by <actor>] [--json]
+                                          Rebuild accepted DB takes from the private ledger
   takes add <slug> --claim "..." --kind <fact|take|bet|hunch> --who <holder>
                    [--weight 0.5] [--source "..."] [--since YYYY-MM]
                                           Append a take (markdown + DB)

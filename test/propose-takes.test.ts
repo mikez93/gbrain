@@ -657,8 +657,8 @@ New prose appended here.`;
     expect(pageSelect!.sql).toContain('SELECT slug, source_id, compiled_truth');
     expect(pageSelect!.sql).not.toContain('*');
     expect(pageSelect!.sql).toContain("frontmatter->>'gbrain_curated'");
-    expect(pageSelect!.sql).toContain('NOT EXISTS');
-    expect(pageSelect!.sql).toContain("digest(coalesce(p.compiled_truth, ''), 'sha256')");
+    expect(pageSelect!.sql).toContain('ORDER BY EXISTS');
+    expect(pageSelect!.sql).toContain("sha256(convert_to(coalesce(p.compiled_truth, ''), 'UTF8'))");
     expect(pageSelect!.params[0]).toBe(PROPOSE_TAKES_PROMPT_VERSION);
     // Scalar sourceId scope from ctx binds as a plain equality param.
     expect(pageSelect!.params[1]).toBe('default');

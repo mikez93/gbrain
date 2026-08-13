@@ -21,12 +21,18 @@ import {
   acceptTakeProposal,
   listTakeProposals,
   proposalCurationSlug,
+  repairAcceptedTakeProposals,
   rejectTakeProposal,
 } from '../src/core/take-proposals.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
+let curationLedgerPath: string;
 const sourceDirs = new Map<string, string>();
+
+function writeScope(sourceId: string) {
+  return { sourceId, curationLedgerPath };
+}
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync('git', ['-C', repo, ...args], {
@@ -107,6 +113,7 @@ function writePage(sourceId: string, slug: string, body = '# Page\n'): string {
 
 beforeAll(async () => {
   brainDir = mkdtempSync(join(tmpdir(), 'gbrain-take-proposals-'));
+  curationLedgerPath = join(brainDir, 'brain-private-curation');
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -191,7 +198,7 @@ describe('acceptTakeProposal', () => {
     const sourcePagePath = join(sourceDirs.get('tenant-a')!, 'topics/a.md');
     const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Promote me', holder: 'garry' });
 
-    const result = await acceptTakeProposal(engine, id, { actedBy: 'test' });
+    const result = await acceptTakeProposal(engine, id, { actedBy: 'test', ...writeScope('tenant-a') });
     expect(result).toMatchObject({
       ok: true,
       proposal_id: id,
@@ -202,13 +209,14 @@ describe('acceptTakeProposal', () => {
     });
     expect(result.page_slug).toStartWith('gbrain-curated/takes/');
 
-    const curationPath = join(sourceDirs.get('tenant-a')!, `${result.page_slug}.md`);
+    const curationPath = join(curationLedgerPath, `${result.page_slug}.md`);
     const body = readFileSync(curationPath, 'utf-8');
     expect(body).toContain('Promote me');
     expect(body).toContain(`proposal:${id}`);
     expect(body).toContain('origin_source_id: tenant-a');
     expect(readFileSync(sourcePagePath, 'utf8')).not.toContain('Promote me');
-    expect(git(sourceDirs.get('tenant-a')!, 'show', `HEAD:${result.page_slug}.md`)).toContain('Promote me');
+    expect(git(curationLedgerPath, 'show', `HEAD:${result.page_slug}.md`)).toContain('Promote me');
+    expect(git(`${curationLedgerPath}.git`, 'show', `main:${result.page_slug}.md`)).toContain('Promote me');
 
     const takes = await engine.listTakes({ page_slug: result.page_slug, sourceId: 'tenant-a' });
     const promoted = takes.find(t => t.claim === 'Promote me')!;
@@ -232,22 +240,22 @@ describe('acceptTakeProposal', () => {
     });
     expect(Number(stamped.promoted_row_num)).toBe(result.row_num);
 
-    const again = await acceptTakeProposal(engine, id, { actedBy: 'test' });
+    const again = await acceptTakeProposal(engine, id, { actedBy: 'test', ...writeScope('tenant-a') });
     expect(again).toMatchObject({ ok: true, idempotent: true, row_num: result.row_num });
   });
 
   test('refuses out-of-scope source and out-of-allow-list holder', async () => {
     const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Scoped claim', holder: 'garry' });
-    await expect(acceptTakeProposal(engine, id, { sourceIds: ['tenant-b'] })).rejects.toThrow('outside your source scope');
+    await expect(acceptTakeProposal(engine, id, { sourceIds: ['tenant-b'] })).rejects.toThrow('requires one explicit source scope');
     await expect(acceptTakeProposal(engine, id, { sourceId: 'tenant-b' })).rejects.toThrow('outside your source scope');
-    await expect(acceptTakeProposal(engine, id, { holdersAllowList: ['world'] })).rejects.toThrow('outside your holder allow-list');
+    await expect(acceptTakeProposal(engine, id, { holdersAllowList: ['world'] })).rejects.toThrow('requires one explicit source scope');
     const [row] = await engine.executeRaw<{ status: string }>(`SELECT status FROM take_proposals WHERE id = $1`, [id]);
     expect(row.status).toBe('pending');
   });
 
   test('refuses a duplicate of an existing active take', async () => {
     const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: '  PROMOTE ME  ', holder: 'garry' });
-    await expect(acceptTakeProposal(engine, id)).rejects.toThrow('duplicates existing take');
+    await expect(acceptTakeProposal(engine, id, writeScope('tenant-a'))).rejects.toThrow('duplicates existing take');
   });
 
   test('a DB mirror failure leaves canonical Git knowledge recoverable on retry', async () => {
@@ -258,7 +266,7 @@ describe('acceptTakeProposal', () => {
       `SELECT content_hash FROM take_proposals WHERE id = $1`, [id],
     );
     const curationSlug = proposalCurationSlug('tenant-a', contentHash);
-    const curationPath = join(sourceDirs.get('tenant-a')!, `${curationSlug}.md`);
+    const curationPath = join(curationLedgerPath, `${curationSlug}.md`);
 
     // Wrap the real engine: same transaction machinery, injected batch failure.
     const failing = Object.create(engine) as BrainEngine;
@@ -269,16 +277,16 @@ describe('acceptTakeProposal', () => {
         return fn(failingTx);
       });
 
-    await expect(acceptTakeProposal(failing, id)).rejects.toThrow('injected addTakesBatch failure');
+    await expect(acceptTakeProposal(failing, id, writeScope('tenant-a'))).rejects.toThrow('injected addTakesBatch failure');
     expect(readFileSync(curationPath, 'utf-8')).toContain('Should not persist');
-    expect(git(sourceDirs.get('tenant-a')!, 'show', `HEAD:${curationSlug}.md`)).toContain('Should not persist');
+    expect(git(curationLedgerPath, 'show', `HEAD:${curationSlug}.md`)).toContain('Should not persist');
     const [row] = await engine.executeRaw<{ status: string; promoted_row_num: number | null }>(
       `SELECT status, promoted_row_num FROM take_proposals WHERE id = $1`, [id],
     );
     expect(row.status).toBe('pending');
     expect(row.promoted_row_num).toBeNull();
 
-    const repaired = await acceptTakeProposal(engine, id, { actedBy: 'repair-test' });
+    const repaired = await acceptTakeProposal(engine, id, { actedBy: 'repair-test', ...writeScope('tenant-a') });
     expect(repaired).toMatchObject({ page_slug: curationSlug, idempotent: false, status: 'accepted' });
     expect((await engine.listTakes({ page_slug: curationSlug, sourceId: 'tenant-a' })).map(t => t.claim))
       .toContain('Should not persist');
@@ -286,7 +294,7 @@ describe('acceptTakeProposal', () => {
 
   test('accept without a real content date leaves since_date unset', async () => {
     const id = await insertProposal({ source_id: 'tenant-b', page_slug: 'topics/b', claim: 'No date here', holder: 'garry' });
-    const result = await acceptTakeProposal(engine, id);
+    const result = await acceptTakeProposal(engine, id, writeScope('tenant-b'));
     expect(result.since_date).toBeUndefined();
   });
 
@@ -302,10 +310,8 @@ describe('acceptTakeProposal', () => {
       source_id: 'tenant-a', page_slug: oldSlug, claim: 'Durable across regeneration',
       holder: 'garry', content_hash: contentHash,
     });
-    const accepted = await acceptTakeProposal(engine, id, { actedBy: 'test' });
-    const canonicalBefore = git(
-      sourceDirs.get('tenant-a')!, 'show', `HEAD:${accepted.page_slug}.md`,
-    );
+    const accepted = await acceptTakeProposal(engine, id, { actedBy: 'test', ...writeScope('tenant-a') });
+    const canonicalBefore = git(curationLedgerPath, 'show', `HEAD:${accepted.page_slug}.md`);
 
     // Simulate the real failure mechanism: an insertion above the section
     // changes start_line, so the generator replaces the old hashed filename.
@@ -321,7 +327,7 @@ describe('acceptTakeProposal', () => {
       title: 'Stable section', type: 'concept', compiled_truth: 'stable section body',
     }, { sourceId: 'tenant-a' });
 
-    expect(git(repo, 'show', `HEAD:${accepted.page_slug}.md`)).toBe(canonicalBefore);
+    expect(git(curationLedgerPath, 'show', `HEAD:${accepted.page_slug}.md`)).toBe(canonicalBefore);
     const takes = await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-a' });
     expect(takes.map(t => t.claim)).toContain('Durable across regeneration');
     const [proposal] = await engine.executeRaw<{ status: string; promoted_row_num: number }>(
@@ -331,7 +337,7 @@ describe('acceptTakeProposal', () => {
     expect(Number(proposal.promoted_row_num)).toBe(accepted.row_num);
   });
 
-  test('commits correctly when a source local_path is nested under its Git worktree', async () => {
+  test('source repository branch switches do not make accepted knowledge blink', async () => {
     const sourceId = 'tenant-nested';
     const { repo, sourceRoot } = initNestedSourceRepo(sourceId);
     await addSource(sourceId, sourceRoot);
@@ -345,11 +351,34 @@ describe('acceptTakeProposal', () => {
       claim: 'Nested source roots are supported',
     });
 
-    const result = await acceptTakeProposal(engine, id);
-    const repoRelativePath = `brain-pages/${result.page_slug}.md`;
-    expect(git(repo, 'show', `HEAD:${repoRelativePath}`)).toContain('Nested source roots are supported');
-    expect(readFileSync(join(sourceRoot, `${result.page_slug}.md`), 'utf8'))
+    const result = await acceptTakeProposal(engine, id, writeScope(sourceId));
+    git(repo, 'checkout', '--quiet', '--orphan', 'empty-source-branch');
+    git(repo, 'rm', '-rf', '--quiet', '.');
+    writeFileSync(join(repo, 'EMPTY.md'), '# Empty source branch\n', 'utf8');
+    git(repo, 'add', '--', 'EMPTY.md');
+    git(repo, 'commit', '--quiet', '-m', 'empty source branch');
+    expect(readFileSync(join(curationLedgerPath, `${result.page_slug}.md`), 'utf8'))
       .toContain('Nested source roots are supported');
+    expect((await engine.listTakes({ page_slug: result.page_slug, sourceId })).map(t => t.claim))
+      .toContain('Nested source roots are supported');
+  });
+
+  test('accepted ledger knowledge automatically repairs a missing DB mirror', async () => {
+    const id = await insertProposal({
+      source_id: 'tenant-b',
+      page_slug: 'topics/b',
+      claim: 'Repair me automatically',
+      holder: 'garry',
+    });
+    const accepted = await acceptTakeProposal(engine, id, writeScope('tenant-b'));
+    await engine.deletePage(accepted.page_slug, { sourceId: 'tenant-b' });
+    expect(await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-b' })).toEqual([]);
+
+    const repaired = await repairAcceptedTakeProposals(engine, writeScope('tenant-b'));
+    expect(repaired.failed).toEqual([]);
+    expect(repaired.repaired).toBeGreaterThanOrEqual(1);
+    expect((await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-b' })).map(t => t.claim))
+      .toContain('Repair me automatically');
   });
 });
 
@@ -358,9 +387,9 @@ describe('rejectTakeProposal', () => {
     const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Reject me', holder: 'garry' });
 
     await expect(rejectTakeProposal(engine, id, { sourceId: 'tenant-b' })).rejects.toThrow('outside your source scope');
-    await expect(rejectTakeProposal(engine, id, { holdersAllowList: ['world'] })).rejects.toThrow('outside your holder allow-list');
+    await expect(rejectTakeProposal(engine, id, { holdersAllowList: ['world'] })).rejects.toThrow('requires one explicit source scope');
 
-    const first = await rejectTakeProposal(engine, id, { actedBy: 'reviewer', reason: 'not supported' });
+    const first = await rejectTakeProposal(engine, id, { actedBy: 'reviewer', reason: 'not supported', sourceId: 'tenant-a' });
     expect(first).toEqual({ ok: true, proposal_id: id, status: 'rejected', idempotent: false, reason: 'not supported' });
     const [row] = await engine.executeRaw<{ status: string; acted_by: string; review_note: string }>(
       `SELECT status, acted_by, review_note FROM take_proposals WHERE id = $1`, [id],
@@ -371,12 +400,12 @@ describe('rejectTakeProposal', () => {
       review_note: 'not supported',
     });
 
-    const second = await rejectTakeProposal(engine, id, { actedBy: 'reviewer' });
+    const second = await rejectTakeProposal(engine, id, { actedBy: 'reviewer', sourceId: 'tenant-a' });
     expect(second.idempotent).toBe(true);
 
     const acceptedId = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Accepted already', holder: 'garry' });
-    await acceptTakeProposal(engine, acceptedId);
-    await expect(rejectTakeProposal(engine, acceptedId)).rejects.toThrow('already accepted');
+    await acceptTakeProposal(engine, acceptedId, writeScope('tenant-a'));
+    await expect(rejectTakeProposal(engine, acceptedId, { sourceId: 'tenant-a' })).rejects.toThrow('already accepted');
   });
 });
 
