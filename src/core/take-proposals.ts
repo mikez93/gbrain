@@ -4,6 +4,7 @@ import {
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BrainEngine, TakeKind } from './engine.ts';
 import { parseMarkdown, serializeMarkdown } from './markdown.ts';
@@ -346,9 +347,18 @@ function syncLedger(worktree: string, mirror: string): void {
 }
 
 function resolveCurationLedger(explicitPath?: string): CurationLedgerPaths {
-  const worktreePath = explicitPath
-    ? resolve(explicitPath)
-    : join(ensureGbrainHome(), 'curation-ledger');
+  const configuredPath = explicitPath ?? process.env.GBRAIN_CURATION_LEDGER_PATH;
+  if (configuredPath && !isAbsolute(configuredPath)) {
+    throw new Error('brain curation ledger path must be absolute');
+  }
+  const brainHome = resolve(ensureGbrainHome());
+  const instanceKey = createHash('sha256').update(brainHome).digest('hex').slice(0, 16);
+  const worktreePath = configuredPath
+    ? resolve(configuredPath)
+    // Canonical approvals have a different rollback timeline from the
+    // disposable/rebuildable brain index. Keep them in owner state outside
+    // GBRAIN_HOME so restoring or replacing the brain cannot erase them.
+    : join(homedir(), '.local', 'state', 'gbrain-curation', instanceKey, 'ledger');
   const mirrorPath = `${worktreePath}.git`;
   const mirror = initBareMirror(mirrorPath);
   const worktree = initLedgerWorktree(worktreePath, mirror);
@@ -811,6 +821,70 @@ export interface TakeProposalRepairResult {
   failed: Array<{ proposal_id: number; error: string }>;
 }
 
+interface LedgerProposalEntry {
+  proposalId: number;
+  sourceId: string;
+  sourcePageSlug: string;
+  contentHash: string;
+  curationSlug: string;
+  relativePath: string;
+  canonicalMarkdown: string;
+  rowNum: number;
+}
+
+function ledgerProposalEntries(worktree: string, sourceId: string): LedgerProposalEntry[] {
+  const paths = gitMaybe(worktree, [
+    'ls-tree', '-r', '--name-only', 'HEAD', '--', CURATION_PREFIX,
+  ]);
+  if (paths === null || paths.trim() === '') return [];
+  const entries: LedgerProposalEntry[] = [];
+  for (const relativePath of paths.split('\n').filter(path => path.endsWith('.md'))) {
+    const canonicalMarkdown = committedBody(worktree, relativePath);
+    if (canonicalMarkdown === null) continue;
+    const curationSlug = relativePath.slice(0, -3);
+    const parsed = parseMarkdown(canonicalMarkdown, relativePath, {
+      validate: true,
+      expectedSlug: curationSlug,
+    });
+    if (parsed.errors && parsed.errors.length > 0) {
+      throw new Error(`committed curation page is invalid: ${relativePath}`);
+    }
+    const pageSourceId = String(parsed.frontmatter.origin_source_id ?? '');
+    const pageContentHash = String(parsed.frontmatter.origin_content_sha256 ?? '');
+    if (pageSourceId !== sourceId) continue;
+    assertCurationFrontmatter(parsed.frontmatter, pageSourceId, pageContentHash);
+    for (const row of parseTakesFence(parsed.compiled_truth).takes) {
+      const match = /^proposal:(\d+); source=([^;]+); page=(.+); content_sha256=([a-f0-9]{64})$/i.exec(
+        row.source ?? '',
+      );
+      if (!match) throw new Error(`curation row ${relativePath}#${row.rowNum} has invalid proposal provenance`);
+      const proposalId = Number(match[1]);
+      const rowSourceId = match[2]!;
+      const sourcePageSlug = match[3]!;
+      const contentHash = match[4]!.toLowerCase();
+      if (
+        !Number.isSafeInteger(proposalId) || proposalId < 1
+        || rowSourceId !== pageSourceId
+        || contentHash !== pageContentHash.toLowerCase()
+        || proposalCurationSlug(rowSourceId, contentHash) !== curationSlug
+      ) {
+        throw new Error(`curation row ${relativePath}#${row.rowNum} does not match its page identity`);
+      }
+      entries.push({
+        proposalId,
+        sourceId: rowSourceId,
+        sourcePageSlug,
+        contentHash,
+        curationSlug,
+        relativePath,
+        canonicalMarkdown,
+        rowNum: row.rowNum,
+      });
+    }
+  }
+  return entries.sort((a, b) => a.proposalId - b.proposalId);
+}
+
 /**
  * Rebuild derived DB pages/takes for accepted proposals from the private Git
  * ledger. Safe to run at startup or after recovery: no inference, no source
@@ -824,33 +898,23 @@ export async function repairAcceptedTakeProposals(
     throw new Error('accepted proposal repair requires one explicit source scope');
   }
   const ledger = resolveCurationLedger(opts.curationLedgerPath);
-  const rows = await engine.executeRaw<ProposalTargetRow & { id: number; canonical_page_slug: string }>(
-    `SELECT tp.id, tp.page_slug, tp.source_id, tp.content_hash, tp.claim_text,
-            tp.holder, tp.status, tp.promoted_row_num, tp.canonical_page_slug,
-            p.effective_date, p.effective_date_source
-       FROM take_proposals tp
-       LEFT JOIN pages p ON p.slug = tp.page_slug AND p.source_id = tp.source_id
-      WHERE tp.status = 'accepted'
-        AND tp.source_id = $1
-        AND tp.promoted_row_num IS NOT NULL
-        AND tp.canonical_page_slug IS NOT NULL
-      ORDER BY tp.id`,
-    [opts.sourceId],
-  );
-  const result: TakeProposalRepairResult = { scanned: rows.length, repaired: 0, failed: [] };
-  for (const row of rows) {
-    const proposalId = Number(row.id);
+  // The ledger is the authority, not the database. This matters after a DB
+  // rollback to a pre-acceptance snapshot: the proposal row is pending again
+  // and has no canonical_page_slug/promoted_row_num marker, while the approval
+  // must remain accepted. Enumerate committed ledger rows and re-stamp the DB.
+  const entries = ledgerProposalEntries(ledger.worktree, opts.sourceId);
+  const result: TakeProposalRepairResult = { scanned: entries.length, repaired: 0, failed: [] };
+  for (const entry of entries) {
+    const proposalId = entry.proposalId;
     try {
+      const row = await lookupProposalTarget(engine, proposalId);
       assertProposalWriteScope(row as unknown as Record<string, unknown>, opts, proposalId);
-      const expectedSlug = proposalCurationSlug(row.source_id, row.content_hash);
-      if (row.canonical_page_slug !== expectedSlug) {
-        throw new Error(`proposal ${proposalId} canonical slug does not match its content identity`);
-      }
-      const sourcePath = curationPath(ledger.worktree, expectedSlug);
-      const relativePath = relative(ledger.worktree, sourcePath.path);
-      const canonicalMarkdown = committedBody(ledger.worktree, relativePath);
-      if (canonicalMarkdown === null) {
-        throw new Error(`proposal ${proposalId} is accepted but missing from the private curation ledger`);
+      if (
+        row.source_id !== entry.sourceId
+        || row.page_slug !== entry.sourcePageSlug
+        || row.content_hash.toLowerCase() !== entry.contentHash
+      ) {
+        throw new Error(`proposal ${proposalId} does not match its private ledger provenance`);
       }
       await mirrorCanonicalCurationToDb(
         engine,
@@ -858,11 +922,11 @@ export async function repairAcceptedTakeProposals(
         row,
         opts,
         opts.actedBy ?? 'gbrain-repair',
-        expectedSlug,
-        relativePath,
-        canonicalMarkdown,
-        Number(row.promoted_row_num),
-        proposalFenceSource(proposalId, row.source_id, row.page_slug, row.content_hash),
+        entry.curationSlug,
+        entry.relativePath,
+        entry.canonicalMarkdown,
+        entry.rowNum,
+        proposalFenceSource(proposalId, entry.sourceId, entry.sourcePageSlug, entry.contentHash),
       );
       result.repaired++;
     } catch (error) {

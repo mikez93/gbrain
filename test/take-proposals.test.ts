@@ -380,6 +380,37 @@ describe('acceptTakeProposal', () => {
     expect((await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-b' })).map(t => t.claim))
       .toContain('Repair me automatically');
   });
+
+  test('accepted ledger knowledge survives a database rollback to pre-acceptance state', async () => {
+    const id = await insertProposal({
+      source_id: 'tenant-b',
+      page_slug: 'topics/b',
+      claim: 'Approval outlives an index rollback',
+      holder: 'garry',
+    });
+    const accepted = await acceptTakeProposal(engine, id, writeScope('tenant-b'));
+
+    // Simulate restoring a database snapshot taken immediately before the
+    // approval. The independently backed-up ledger is intentionally untouched.
+    await engine.deletePage(accepted.page_slug, { sourceId: 'tenant-b' });
+    await engine.executeRaw(
+      `UPDATE take_proposals
+          SET status = 'pending', acted_at = NULL, acted_by = NULL,
+              promoted_row_num = NULL, canonical_page_slug = NULL
+        WHERE id = $1`,
+      [id],
+    );
+
+    const repaired = await repairAcceptedTakeProposals(engine, writeScope('tenant-b'));
+    expect(repaired.failed).toEqual([]);
+    const [proposal] = await engine.executeRaw<{ status: string; promoted_row_num: number | null }>(
+      `SELECT status, promoted_row_num FROM take_proposals WHERE id = $1`, [id],
+    );
+    expect(proposal.status).toBe('accepted');
+    expect(Number(proposal.promoted_row_num)).toBe(accepted.row_num);
+    expect((await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-b' })).map(t => t.claim))
+      .toContain('Approval outlives an index rollback');
+  });
 });
 
 describe('rejectTakeProposal', () => {
