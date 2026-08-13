@@ -6184,6 +6184,28 @@ export const MIGRATIONS: Migration[] = [
         ON chat_usage_log (model, created_at);
     `,
   },
+  {
+    version: 141,
+    name: 'kepler_proposal_audit_and_v127_reconciliation',
+    // The pre-v0.46 Kepler fork used schema version 127 for the proposal
+    // review columns before upstream assigned v127 to OAuth surface metadata.
+    // A brain stamped by that fork would otherwise skip upstream v127 while
+    // applying v128+, leaving a false-green schema. Re-apply both additive
+    // shapes here so fresh, upstream-only, and fork-upgraded brains converge.
+    idempotent: true,
+    sql: `
+      ALTER TABLE take_proposals
+        ADD COLUMN IF NOT EXISTS canonical_page_slug TEXT;
+      ALTER TABLE take_proposals
+        ADD COLUMN IF NOT EXISTS review_note TEXT;
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS surface TEXT;
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS surface_set_by TEXT;
+      CREATE INDEX IF NOT EXISTS idx_minion_jobs_queue_status_updated
+        ON minion_jobs (queue, status, updated_at);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

@@ -278,7 +278,9 @@ const OP_AREAS: Record<string, string> = {
   resume_job: 'jobs', replay_job: 'jobs', send_job_message: 'jobs',
   submit_agent: 'jobs', get_agent_job: 'jobs',
   // takes + think
-  takes_list: 'takes', takes_search: 'takes', think: 'takes',
+  takes_list: 'takes', takes_search: 'takes',
+  takes_propose_list: 'takes', takes_propose_accept: 'takes', takes_propose_reject: 'takes',
+  think: 'takes',
   takes_scorecard: 'takes', takes_calibration: 'takes',
   // hot memory (facts)
   extract_facts: 'memory', forget_fact: 'memory',

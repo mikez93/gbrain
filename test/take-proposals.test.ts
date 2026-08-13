@@ -1,261 +1,452 @@
 /**
- * #2411 — take_proposals drain surface.
+ * Review-first take proposal lifecycle (#2269, takeover of PR #2418):
+ * list / accept / reject over the shared operation registry, plus the
+ * source-isolation + holder-allow-list repairs.
  *
- * The propose_takes cycle phase writes proposals to `take_proposals`, and the
- * D17 posture says explicit operator accept is the ONLY queue→canonical path.
- * Before this fix nothing implemented that path: `gbrain takes propose` fell
- * through the dispatcher to the page-slug branch and printed
- * "No takes on propose." (exit 0), so proposals accumulated forever and
- * nothing ever wrote status='accepted'.
- *
- * Covers, against a real PGLite engine + temp markdown repo:
- *   - listPendingProposals: pending-only (tombstones/acted rows excluded),
- *     source-scoped
- *   - acceptProposal: fence write via addTakeToPage + status='accepted' +
- *     promoted_row_num/acted_at/acted_by stamps
- *   - rejectProposal: status='rejected' + stamps, no markdown write
- *   - double-accept refuses with not_pending
- *   - source scope: an out-of-scope id reads as not_found
- *   - CLI dispatcher: `takes propose` no longer falls through to the slug path
+ * Real PGLite engine (in-memory, no DATABASE_URL) so the SQL shapes
+ * (FOR UPDATE OF, pg_advisory_xact_lock, ANY($::text[])) run for real.
  */
-
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
+import { dispatchToolCall } from '../src/mcp/dispatch.ts';
+import { operations } from '../src/core/operations.ts';
+import { buildToolDefs } from '../src/mcp/tool-defs.ts';
 import {
-  listPendingProposals,
-  acceptProposal,
-  rejectProposal,
-  coerceProposalKind,
-  TakeProposalError,
+  acceptTakeProposal,
+  listTakeProposals,
+  proposalCurationSlug,
+  repairAcceptedTakeProposals,
+  rejectTakeProposal,
 } from '../src/core/take-proposals.ts';
-import { runTakes } from '../src/commands/takes.ts';
-import { parseTakesFence } from '../src/core/takes-fence.ts';
 
 let engine: PGLiteEngine;
-let repo: string;
+let brainDir: string;
+let curationLedgerPath: string;
+const sourceDirs = new Map<string, string>();
 
-async function insertProposal(opts: {
-  slug: string;
+function writeScope(sourceId: string) {
+  return { sourceId, curationLedgerPath };
+}
+
+function git(repo: string, ...args: string[]): string {
+  return execFileSync('git', ['-C', repo, ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function initSourceRepo(id: string): string {
+  const repo = join(brainDir, id);
+  mkdirSync(repo, { recursive: true });
+  git(repo, 'init', '--quiet');
+  git(repo, 'config', 'user.name', 'GBrain Test');
+  git(repo, 'config', 'user.email', 'gbrain-test@localhost');
+  writeFileSync(join(repo, 'README.md'), `# ${id}\n`, 'utf8');
+  git(repo, 'add', '--', 'README.md');
+  git(repo, 'commit', '--quiet', '-m', 'test source baseline');
+  sourceDirs.set(id, repo);
+  return repo;
+}
+
+function initNestedSourceRepo(id: string): { repo: string; sourceRoot: string } {
+  const repo = join(brainDir, `${id}-parent`);
+  const sourceRoot = join(repo, 'brain-pages');
+  mkdirSync(sourceRoot, { recursive: true });
+  git(repo, 'init', '--quiet');
+  git(repo, 'config', 'user.name', 'GBrain Test');
+  git(repo, 'config', 'user.email', 'gbrain-test@localhost');
+  writeFileSync(join(repo, 'README.md'), `# ${id}\n`, 'utf8');
+  git(repo, 'add', '--', 'README.md');
+  git(repo, 'commit', '--quiet', '-m', 'test nested source baseline');
+  sourceDirs.set(id, sourceRoot);
+  return { repo, sourceRoot };
+}
+
+async function addSource(id: string, localPath: string): Promise<void> {
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name, local_path, config, created_at)
+     VALUES ($1, $1, $2, '{}'::jsonb, NOW()) ON CONFLICT (id) DO NOTHING`,
+    [id, localPath],
+  );
+}
+
+async function insertProposal(p: {
+  source_id: string;
+  page_slug: string;
   claim: string;
-  sourceId?: string;
-  kind?: string;
   holder?: string;
+  kind?: string;
   weight?: number;
-  status?: string;
+  content_hash?: string;
 }): Promise<number> {
+  const hash = p.content_hash ?? createHash('sha256')
+    .update(`${p.source_id}\0${p.page_slug}\0${p.claim}\0${randomUUID()}`)
+    .digest('hex');
   const rows = await engine.executeRaw<{ id: number }>(
     `INSERT INTO take_proposals
        (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
-        claim_text, kind, holder, weight, domain, model_id, status)
-     VALUES ($1, $2, md5($6), 'test-v1', 'run-test', $6, $3, $4, $5, NULL, 'test-model', $7)
+        claim_text, kind, holder, weight, model_id)
+     VALUES ($1, $2, $7, 'v1', 'run-test', $6, $3, $4, $5, 'test-model')
      RETURNING id`,
-    [
-      opts.sourceId ?? 'default',
-      opts.slug,
-      opts.kind ?? 'bet',
-      opts.holder ?? 'world',
-      opts.weight ?? 0.7,
-      opts.claim,
-      opts.status ?? 'pending',
-    ],
+    [p.source_id, p.page_slug, p.kind ?? 'take', p.holder ?? 'garry', p.weight ?? 0.7, p.claim, hash],
   );
-  return rows[0].id;
+  return Number(rows[0].id);
 }
 
-async function proposalRow(id: number) {
-  const rows = await engine.executeRaw<{
-    status: string; promoted_row_num: number | null; acted_by: string | null; acted_at: string | null;
-  }>(`SELECT status, promoted_row_num, acted_by, acted_at FROM take_proposals WHERE id = $1`, [id]);
-  return rows[0];
-}
-
-async function captureStdout(fn: () => Promise<void>): Promise<string> {
-  const lines: string[] = [];
-  const orig = console.log;
-  console.log = (...args: unknown[]) => { lines.push(args.join(' ')); };
-  try {
-    await fn();
-  } finally {
-    console.log = orig;
-  }
-  return lines.join('\n');
+function writePage(sourceId: string, slug: string, body = '# Page\n'): string {
+  const repo = sourceDirs.get(sourceId);
+  if (!repo) throw new Error(`test source is not initialized: ${sourceId}`);
+  const path = join(repo, `${slug}.md`);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, body, 'utf-8');
+  const relativePath = `${slug}.md`;
+  git(repo, 'add', '--', relativePath);
+  git(repo, 'commit', '--quiet', '-m', `test source page ${slug}`, '--', relativePath);
+  return path;
 }
 
 beforeAll(async () => {
+  brainDir = mkdtempSync(join(tmpdir(), 'gbrain-take-proposals-'));
+  curationLedgerPath = join(brainDir, 'brain-private-curation');
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  repo = mkdtempSync(join(tmpdir(), 'gbrain-take-proposals-'));
-  await engine.setConfig('sync.repo_path', repo);
+  await addSource('tenant-a', initSourceRepo('tenant-a'));
+  await addSource('tenant-b', initSourceRepo('tenant-b'));
+  writePage('tenant-a', 'topics/a', '# A\n\nBody\n');
+  writePage('tenant-b', 'topics/b', '# B\n\nBody\n');
+  await engine.putPage('topics/a', { title: 'A', type: 'concept', compiled_truth: 'Body' }, { sourceId: 'tenant-a' });
+  await engine.putPage('topics/b', { title: 'B', type: 'concept', compiled_truth: 'Body' }, { sourceId: 'tenant-b' });
+  // Real content date on topics/a so accept threads since_date.
   await engine.executeRaw(
-    `INSERT INTO sources (id, name) VALUES ('other', 'Other') ON CONFLICT (id) DO NOTHING`,
-    [],
+    `UPDATE pages SET effective_date = '2024-03-02', effective_date_source = 'frontmatter' WHERE slug = 'topics/a'`,
   );
-  for (const slug of ['companies/acme-example', 'companies/widget-co']) {
-    await engine.putPage(slug, { type: 'company', title: slug, compiled_truth: `about ${slug}` });
-    mkdirSync(join(repo, 'companies'), { recursive: true });
-    writeFileSync(join(repo, `${slug}.md`), `# ${slug}\n\nabout ${slug}\n`, 'utf-8');
-  }
-});
+}, 30000);
 
 afterAll(async () => {
   await engine.disconnect();
+  rmSync(brainDir, { recursive: true, force: true });
 });
 
-describe('listPendingProposals', () => {
-  test('lists pending rows only, excluding acted rows and other sources', async () => {
-    const pendingId = await insertProposal({ slug: 'companies/acme-example', claim: 'list: pending claim' });
-    const rejectedId = await insertProposal({
-      slug: 'companies/acme-example', claim: 'list: already rejected', status: 'rejected',
-    });
-    const otherSourceId = await insertProposal({
-      slug: 'companies/acme-example', claim: 'list: other-source claim', sourceId: 'other',
-    });
+describe('listTakeProposals — scope isolation', () => {
+  let idA: number;
+  let idB: number;
+  let idWorld: number;
 
-    const rows = await listPendingProposals(engine, { sourceId: 'default', limit: 50 });
-    const ids = rows.map((r) => r.id);
-    expect(ids).toContain(pendingId);
-    expect(ids).not.toContain(rejectedId);
-    expect(ids).not.toContain(otherSourceId);
-    for (const r of rows) expect(r.status).toBe('pending');
+  beforeAll(async () => {
+    idA = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'A will happen', holder: 'garry' });
+    idB = await insertProposal({ source_id: 'tenant-b', page_slug: 'topics/b', claim: 'B will happen', holder: 'garry' });
+    idWorld = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Public claim', holder: 'world' });
+  });
+
+  test('unscoped (trusted local) sees all pending proposals', async () => {
+    const rows = await listTakeProposals(engine);
+    const ids = rows.map(r => r.id);
+    expect(ids).toContain(idA);
+    expect(ids).toContain(idB);
+    expect(ids).toContain(idWorld);
+  });
+
+  test('scalar sourceId filters to that source', async () => {
+    const rows = await listTakeProposals(engine, { sourceId: 'tenant-b' });
+    expect(rows.map(r => r.id)).toEqual([idB]);
+  });
+
+  test('federated sourceIds array filters to the grant', async () => {
+    const rows = await listTakeProposals(engine, { sourceIds: ['tenant-a'] });
+    const ids = rows.map(r => r.id).sort();
+    expect(ids).toEqual([idA, idWorld].sort());
+  });
+
+  test('holdersAllowList hides other holders; empty list matches nothing', async () => {
+    const world = await listTakeProposals(engine, { holdersAllowList: ['world'] });
+    expect(world.map(r => r.id)).toEqual([idWorld]);
+    expect(await listTakeProposals(engine, { holdersAllowList: [] })).toEqual([]);
+  });
+
+  test('invalid status is rejected', async () => {
+    await expect(listTakeProposals(engine, { status: 'garbage' as never })).rejects.toThrow('invalid proposal status');
+  });
+
+  test('takes_propose_list op threads source scope + holder allow-list (remote)', async () => {
+    const result = await dispatchToolCall(engine, 'takes_propose_list', {}, {
+      remote: true,
+      sourceId: 'tenant-a',
+      takesHoldersAllowList: ['world'],
+    });
+    expect(result.isError).toBeFalsy();
+    const rows = JSON.parse(result.content[0].text) as Array<{ id: number; holder: string; source_id: string }>;
+    expect(rows.map(r => r.id)).toEqual([idWorld]);
+  });
+
+  test('list surfaces page effective-date metadata', async () => {
+    const rows = await listTakeProposals(engine, { sourceIds: ['tenant-a'] });
+    const a = rows.find(r => r.id === idA)!;
+    expect(a.effective_date).toContain('2024-03-02');
+    expect(a.effective_date_source).toBe('frontmatter');
   });
 });
 
-describe('acceptProposal', () => {
-  test('promotes into the fence via addTakeToPage and stamps accepted + promoted_row_num', async () => {
-    const id = await insertProposal({
-      slug: 'companies/acme-example', claim: 'Acme ships the widget by Q3', kind: 'bet', weight: 0.8,
-    });
-    const { rowNum, proposal } = await acceptProposal(
-      { engine, brainDir: repo, sourceId: 'default', actedBy: 'people/tester' },
-      id,
-    );
-    expect(proposal.page_slug).toBe('companies/acme-example');
-    expect(rowNum).toBeGreaterThan(0);
+describe('acceptTakeProposal', () => {
+  test('promotes into a durable curation page, mirrors DB, stamps proposal; idempotent re-accept', async () => {
+    const sourcePagePath = join(sourceDirs.get('tenant-a')!, 'topics/a.md');
+    const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Promote me', holder: 'garry' });
 
-    // Markdown-canonical: the fence on disk holds the promoted claim.
-    const fence = parseTakesFence(readFileSync(join(repo, 'companies/acme-example.md'), 'utf-8'));
-    const promoted = fence.takes.find((t) => t.claim === 'Acme ships the widget by Q3');
+    const result = await acceptTakeProposal(engine, id, { actedBy: 'test', ...writeScope('tenant-a') });
+    expect(result).toMatchObject({
+      ok: true,
+      proposal_id: id,
+      source_page_slug: 'topics/a',
+      status: 'accepted',
+      idempotent: false,
+      since_date: '2024-03-02',
+    });
+    expect(result.page_slug).toStartWith('gbrain-curated/takes/');
+
+    const curationPath = join(curationLedgerPath, `${result.page_slug}.md`);
+    const body = readFileSync(curationPath, 'utf-8');
+    expect(body).toContain('Promote me');
+    expect(body).toContain(`proposal:${id}`);
+    expect(body).toContain('origin_source_id: tenant-a');
+    expect(readFileSync(sourcePagePath, 'utf8')).not.toContain('Promote me');
+    expect(git(curationLedgerPath, 'show', `HEAD:${result.page_slug}.md`)).toContain('Promote me');
+    expect(git(`${curationLedgerPath}.git`, 'show', `main:${result.page_slug}.md`)).toContain('Promote me');
+
+    const takes = await engine.listTakes({ page_slug: result.page_slug, sourceId: 'tenant-a' });
+    const promoted = takes.find(t => t.claim === 'Promote me')!;
     expect(promoted).toBeDefined();
-    expect(promoted!.rowNum).toBe(rowNum);
+    expect(promoted.row_num).toBe(result.row_num);
+    expect(promoted.since_date).toContain('2024-03-02');
 
-    // DB mirror carries the row too.
-    const takes = await engine.listTakes({ page_slug: 'companies/acme-example', active: true });
-    expect(takes.some((t) => t.claim === 'Acme ships the widget by Q3' && t.row_num === rowNum)).toBe(true);
-
-    // Queue row is stamped.
-    const row = await proposalRow(id);
-    expect(row.status).toBe('accepted');
-    expect(row.promoted_row_num).toBe(rowNum);
-    expect(row.acted_by).toBe('people/tester');
-    expect(row.acted_at).not.toBeNull();
-  });
-
-  test('double-accept refuses with not_pending', async () => {
-    const id = await insertProposal({ slug: 'companies/widget-co', claim: 'Widget-co raises fund-a next year' });
-    await acceptProposal({ engine, brainDir: repo, sourceId: 'default' }, id);
-    try {
-      await acceptProposal({ engine, brainDir: repo, sourceId: 'default' }, id);
-      throw new Error('should have thrown');
-    } catch (err) {
-      expect((err as TakeProposalError).code).toBe('not_pending');
-    }
-  });
-
-  test('source scope: accepting an out-of-scope proposal reads as not_found', async () => {
-    const id = await insertProposal({
-      slug: 'companies/acme-example', claim: 'scope: other-source only', sourceId: 'other',
+    const [stamped] = await engine.executeRaw<{
+      status: string;
+      acted_by: string;
+      promoted_row_num: number;
+      canonical_page_slug: string;
+    }>(
+      `SELECT status, acted_by, promoted_row_num, canonical_page_slug
+         FROM take_proposals WHERE id = $1`, [id],
+    );
+    expect(stamped).toMatchObject({
+      status: 'accepted',
+      acted_by: 'test',
+      canonical_page_slug: result.page_slug,
     });
-    try {
-      await acceptProposal({ engine, brainDir: repo, sourceId: 'default' }, id);
-      throw new Error('should have thrown');
-    } catch (err) {
-      expect(err).toBeInstanceOf(TakeProposalError);
-      expect((err as TakeProposalError).code).toBe('not_found');
-    }
-    // Row untouched.
-    expect((await proposalRow(id)).status).toBe('pending');
+    expect(Number(stamped.promoted_row_num)).toBe(result.row_num);
+
+    const again = await acceptTakeProposal(engine, id, { actedBy: 'test', ...writeScope('tenant-a') });
+    expect(again).toMatchObject({ ok: true, idempotent: true, row_num: result.row_num });
   });
 
-  test('unknown id → not_found', async () => {
-    try {
-      await acceptProposal({ engine, brainDir: repo, sourceId: 'default' }, 99999999);
-      throw new Error('should have thrown');
-    } catch (err) {
-      expect((err as TakeProposalError).code).toBe('not_found');
-    }
-  });
-});
-
-describe('rejectProposal', () => {
-  test('stamps rejected + acted_by without touching the fence', async () => {
-    const before = readFileSync(join(repo, 'companies/widget-co.md'), 'utf-8');
-    const id = await insertProposal({ slug: 'companies/widget-co', claim: 'reject: never promoted' });
-    const proposal = await rejectProposal({ engine, sourceId: 'default', actedBy: 'people/tester' }, id);
-    expect(proposal.claim_text).toBe('reject: never promoted');
-    const row = await proposalRow(id);
-    expect(row.status).toBe('rejected');
-    expect(row.acted_by).toBe('people/tester');
-    // No markdown write happened (reject is DB-only).
-    const after = readFileSync(join(repo, 'companies/widget-co.md'), 'utf-8');
-    expect(after.includes('reject: never promoted')).toBe(false);
-    expect(after.length >= before.length).toBe(true);
+  test('refuses out-of-scope source and out-of-allow-list holder', async () => {
+    const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Scoped claim', holder: 'garry' });
+    await expect(acceptTakeProposal(engine, id, { sourceIds: ['tenant-b'] })).rejects.toThrow('requires one explicit source scope');
+    await expect(acceptTakeProposal(engine, id, { sourceId: 'tenant-b' })).rejects.toThrow('outside your source scope');
+    await expect(acceptTakeProposal(engine, id, { holdersAllowList: ['world'] })).rejects.toThrow('requires one explicit source scope');
+    const [row] = await engine.executeRaw<{ status: string }>(`SELECT status FROM take_proposals WHERE id = $1`, [id]);
+    expect(row.status).toBe('pending');
   });
 
-  test('rejecting an acted row refuses with not_pending', async () => {
+  test('refuses a duplicate of an existing active take', async () => {
+    const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: '  PROMOTE ME  ', holder: 'garry' });
+    await expect(acceptTakeProposal(engine, id, writeScope('tenant-a'))).rejects.toThrow('duplicates existing take');
+  });
+
+  test('a DB mirror failure leaves canonical Git knowledge recoverable on retry', async () => {
+    writePage('tenant-a', 'topics/a-rollback', '# Rollback\n');
+    await engine.putPage('topics/a-rollback', { title: 'R', type: 'concept', compiled_truth: 'Body' }, { sourceId: 'tenant-a' });
+    const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a-rollback', claim: 'Should not persist', holder: 'garry' });
+    const [{ content_hash: contentHash }] = await engine.executeRaw<{ content_hash: string }>(
+      `SELECT content_hash FROM take_proposals WHERE id = $1`, [id],
+    );
+    const curationSlug = proposalCurationSlug('tenant-a', contentHash);
+    const curationPath = join(curationLedgerPath, `${curationSlug}.md`);
+
+    // Wrap the real engine: same transaction machinery, injected batch failure.
+    const failing = Object.create(engine) as BrainEngine;
+    failing.transaction = <T>(fn: (tx: BrainEngine) => Promise<T>) =>
+      engine.transaction((tx) => {
+        const failingTx = Object.create(tx) as BrainEngine;
+        failingTx.addTakesBatch = async () => { throw new Error('injected addTakesBatch failure'); };
+        return fn(failingTx);
+      });
+
+    await expect(acceptTakeProposal(failing, id, writeScope('tenant-a'))).rejects.toThrow('injected addTakesBatch failure');
+    expect(readFileSync(curationPath, 'utf-8')).toContain('Should not persist');
+    expect(git(curationLedgerPath, 'show', `HEAD:${curationSlug}.md`)).toContain('Should not persist');
+    const [row] = await engine.executeRaw<{ status: string; promoted_row_num: number | null }>(
+      `SELECT status, promoted_row_num FROM take_proposals WHERE id = $1`, [id],
+    );
+    expect(row.status).toBe('pending');
+    expect(row.promoted_row_num).toBeNull();
+
+    const repaired = await acceptTakeProposal(engine, id, { actedBy: 'repair-test', ...writeScope('tenant-a') });
+    expect(repaired).toMatchObject({ page_slug: curationSlug, idempotent: false, status: 'accepted' });
+    expect((await engine.listTakes({ page_slug: curationSlug, sourceId: 'tenant-a' })).map(t => t.claim))
+      .toContain('Should not persist');
+  });
+
+  test('accept without a real content date leaves since_date unset', async () => {
+    const id = await insertProposal({ source_id: 'tenant-b', page_slug: 'topics/b', claim: 'No date here', holder: 'garry' });
+    const result = await acceptTakeProposal(engine, id, writeScope('tenant-b'));
+    expect(result.since_date).toBeUndefined();
+  });
+
+  test('accepted knowledge survives a managed-page identity shift after an edit above its section', async () => {
+    const contentHash = createHash('sha256').update('stable section body').digest('hex');
+    const oldSlug = 'managed/hash-before-memory-1';
+    const newSlug = 'managed/hash-after-memory-1';
+    writePage('tenant-a', oldSlug, '# Prior heading\n\nStable section body\n');
+    await engine.putPage(oldSlug, {
+      title: 'Stable section', type: 'concept', compiled_truth: 'stable section body',
+    }, { sourceId: 'tenant-a' });
     const id = await insertProposal({
-      slug: 'companies/widget-co', claim: 'reject: already accepted', status: 'accepted',
+      source_id: 'tenant-a', page_slug: oldSlug, claim: 'Durable across regeneration',
+      holder: 'garry', content_hash: contentHash,
     });
-    try {
-      await rejectProposal({ engine, sourceId: 'default' }, id);
-      throw new Error('should have thrown');
-    } catch (err) {
-      expect((err as TakeProposalError).code).toBe('not_pending');
-    }
+    const accepted = await acceptTakeProposal(engine, id, { actedBy: 'test', ...writeScope('tenant-a') });
+    const canonicalBefore = git(curationLedgerPath, 'show', `HEAD:${accepted.page_slug}.md`);
+
+    // Simulate the real failure mechanism: an insertion above the section
+    // changes start_line, so the generator replaces the old hashed filename.
+    const repo = sourceDirs.get('tenant-a')!;
+    rmSync(join(repo, `${oldSlug}.md`));
+    const newPath = join(repo, `${newSlug}.md`);
+    mkdirSync(dirname(newPath), { recursive: true });
+    writeFileSync(newPath, '# Inserted heading\n\n# Prior heading\n\nStable section body\n', 'utf8');
+    git(repo, 'add', '-A', '--', 'managed');
+    git(repo, 'commit', '--quiet', '-m', 'regenerate after line insertion', '--', 'managed');
+    await engine.deletePage(oldSlug, { sourceId: 'tenant-a' });
+    await engine.putPage(newSlug, {
+      title: 'Stable section', type: 'concept', compiled_truth: 'stable section body',
+    }, { sourceId: 'tenant-a' });
+
+    expect(git(curationLedgerPath, 'show', `HEAD:${accepted.page_slug}.md`)).toBe(canonicalBefore);
+    const takes = await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-a' });
+    expect(takes.map(t => t.claim)).toContain('Durable across regeneration');
+    const [proposal] = await engine.executeRaw<{ status: string; promoted_row_num: number }>(
+      `SELECT status, promoted_row_num FROM take_proposals WHERE id = $1`, [id],
+    );
+    expect(proposal.status).toBe('accepted');
+    expect(Number(proposal.promoted_row_num)).toBe(accepted.row_num);
+  });
+
+  test('source repository branch switches do not make accepted knowledge blink', async () => {
+    const sourceId = 'tenant-nested';
+    const { repo, sourceRoot } = initNestedSourceRepo(sourceId);
+    await addSource(sourceId, sourceRoot);
+    writePage(sourceId, 'topics/nested', '# Nested\n\nBody\n');
+    await engine.putPage('topics/nested', {
+      title: 'Nested', type: 'concept', compiled_truth: 'Body',
+    }, { sourceId });
+    const id = await insertProposal({
+      source_id: sourceId,
+      page_slug: 'topics/nested',
+      claim: 'Nested source roots are supported',
+    });
+
+    const result = await acceptTakeProposal(engine, id, writeScope(sourceId));
+    git(repo, 'checkout', '--quiet', '--orphan', 'empty-source-branch');
+    git(repo, 'rm', '-rf', '--quiet', '.');
+    writeFileSync(join(repo, 'EMPTY.md'), '# Empty source branch\n', 'utf8');
+    git(repo, 'add', '--', 'EMPTY.md');
+    git(repo, 'commit', '--quiet', '-m', 'empty source branch');
+    expect(readFileSync(join(curationLedgerPath, `${result.page_slug}.md`), 'utf8'))
+      .toContain('Nested source roots are supported');
+    expect((await engine.listTakes({ page_slug: result.page_slug, sourceId })).map(t => t.claim))
+      .toContain('Nested source roots are supported');
+  });
+
+  test('accepted ledger knowledge automatically repairs a missing DB mirror', async () => {
+    const id = await insertProposal({
+      source_id: 'tenant-b',
+      page_slug: 'topics/b',
+      claim: 'Repair me automatically',
+      holder: 'garry',
+    });
+    const accepted = await acceptTakeProposal(engine, id, writeScope('tenant-b'));
+    await engine.deletePage(accepted.page_slug, { sourceId: 'tenant-b' });
+    expect(await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-b' })).toEqual([]);
+
+    const repaired = await repairAcceptedTakeProposals(engine, writeScope('tenant-b'));
+    expect(repaired.failed).toEqual([]);
+    expect(repaired.repaired).toBeGreaterThanOrEqual(1);
+    expect((await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-b' })).map(t => t.claim))
+      .toContain('Repair me automatically');
   });
 });
 
-describe('coerceProposalKind', () => {
-  test('canonical kinds pass through; prediction→bet; unknown→take', () => {
-    expect(coerceProposalKind('bet')).toBe('bet');
-    expect(coerceProposalKind('fact')).toBe('fact');
-    expect(coerceProposalKind('hunch')).toBe('hunch');
-    expect(coerceProposalKind('take')).toBe('take');
-    expect(coerceProposalKind('prediction')).toBe('bet');
-    expect(coerceProposalKind('garbage')).toBe('take');
+describe('rejectTakeProposal', () => {
+  test('stamps pending → rejected; idempotent; refuses accepted; enforces scope', async () => {
+    const id = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Reject me', holder: 'garry' });
+
+    await expect(rejectTakeProposal(engine, id, { sourceId: 'tenant-b' })).rejects.toThrow('outside your source scope');
+    await expect(rejectTakeProposal(engine, id, { holdersAllowList: ['world'] })).rejects.toThrow('requires one explicit source scope');
+
+    const first = await rejectTakeProposal(engine, id, { actedBy: 'reviewer', reason: 'not supported', sourceId: 'tenant-a' });
+    expect(first).toEqual({ ok: true, proposal_id: id, status: 'rejected', idempotent: false, reason: 'not supported' });
+    const [row] = await engine.executeRaw<{ status: string; acted_by: string; review_note: string }>(
+      `SELECT status, acted_by, review_note FROM take_proposals WHERE id = $1`, [id],
+    );
+    expect(row).toMatchObject({
+      status: 'rejected',
+      acted_by: 'reviewer',
+      review_note: 'not supported',
+    });
+
+    const second = await rejectTakeProposal(engine, id, { actedBy: 'reviewer', sourceId: 'tenant-a' });
+    expect(second.idempotent).toBe(true);
+
+    const acceptedId = await insertProposal({ source_id: 'tenant-a', page_slug: 'topics/a', claim: 'Accepted already', holder: 'garry' });
+    await acceptTakeProposal(engine, acceptedId, writeScope('tenant-a'));
+    await expect(rejectTakeProposal(engine, acceptedId, { sourceId: 'tenant-a' })).rejects.toThrow('already accepted');
   });
 });
 
-describe('CLI dispatcher (#2411 no-fallthrough)', () => {
-  test('`takes propose` lists the queue instead of slug-ifying "propose"', async () => {
-    const id = await insertProposal({ slug: 'companies/acme-example', claim: 'cli: pending list claim' });
-    const out = await captureStdout(() => runTakes(engine, ['propose']));
-    expect(out).not.toContain('No takes on propose.');
-    expect(out).toContain('cli: pending list claim');
-    expect(out).toContain(`#${id}`);
+describe('take proposal MCP operation schema', () => {
+  test('exposes list/accept/reject through the shared operation registry with correct scopes', () => {
+    const byName = Object.fromEntries(operations.map((op) => [op.name, op]));
+    expect(byName.takes_propose_list?.scope).toBe('read');
+    expect(byName.takes_propose_accept?.scope).toBe('write');
+    expect(byName.takes_propose_reject?.scope).toBe('write');
+    expect(byName.takes_propose_accept.params.proposal_id.required).toBe(true);
+    expect(byName.takes_propose_reject.params.proposal_id.required).toBe(true);
+
+    const defs = Object.fromEntries(buildToolDefs(operations).map((def) => [def.name, def]));
+    expect(defs.takes_propose_accept.inputSchema.required).toEqual(['proposal_id']);
+    expect(defs.takes_propose_reject.inputSchema.required).toEqual(['proposal_id']);
+    expect(Object.keys(defs.takes_propose_list.inputSchema.properties)).toEqual(['limit', 'offset', 'status']);
   });
 
-  test('`takes propose --json` returns rows', async () => {
-    const out = await captureStdout(() => runTakes(engine, ['propose', '--json', '--limit', '100']));
-    const parsed = JSON.parse(out);
-    expect(Array.isArray(parsed)).toBe(true);
-    expect(parsed.some((r: { claim_text: string }) => r.claim_text === 'cli: pending list claim')).toBe(true);
-  });
-
-  test('`takes propose --accept <id>` promotes and reports the fence row', async () => {
-    const id = await insertProposal({ slug: 'companies/acme-example', claim: 'cli: accept me' });
-    const out = await captureStdout(() => runTakes(engine, ['propose', '--accept', String(id)]));
-    expect(out).toContain(`Accepted proposal #${id}`);
-    expect((await proposalRow(id)).status).toBe('accepted');
-  });
-
-  test('`takes propose --reject <id>` rejects', async () => {
-    const id = await insertProposal({ slug: 'companies/acme-example', claim: 'cli: reject me' });
-    const out = await captureStdout(() => runTakes(engine, ['propose', '--reject', String(id)]));
-    expect(out).toContain(`Rejected proposal #${id}`);
-    expect((await proposalRow(id)).status).toBe('rejected');
+  test('federated read grants never widen scalar proposal-write authority', async () => {
+    const id = await insertProposal({
+      source_id: 'tenant-b',
+      page_slug: 'topics/b',
+      claim: 'Neighboring source must stay pending',
+      holder: 'garry',
+    });
+    const result = await dispatchToolCall(engine, 'takes_propose_accept', { proposal_id: id }, {
+      remote: true,
+      sourceId: 'tenant-a',
+      auth: {
+        token: 'test-token',
+        clientId: 'reviewer',
+        scopes: ['write'],
+        allowedSources: ['tenant-a', 'tenant-b'],
+      },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('outside your source scope');
+    const [proposal] = await engine.executeRaw<{ status: string }>(
+      `SELECT status FROM take_proposals WHERE id = $1`,
+      [id],
+    );
+    expect(proposal.status).toBe('pending');
   });
 });

@@ -234,22 +234,38 @@ async function listCandidatePages(
   engine: BrainEngine,
   scope: ScopedReadOpts,
   limit: number,
+  promptVersion: string,
 ): Promise<ProposeTakesPageRow[]> {
-  const where = ['deleted_at IS NULL'];
-  const params: unknown[] = [];
+  const alreadyProcessed = `EXISTS (
+       SELECT 1
+         FROM take_proposals tp
+        WHERE tp.source_id = p.source_id
+          AND tp.page_slug = p.slug
+          AND tp.content_hash = encode(sha256(convert_to(coalesce(p.compiled_truth, ''), 'UTF8')), 'hex')
+          AND tp.prompt_version = $1
+     )`;
+  const where = [
+    'p.deleted_at IS NULL',
+    // Accepted proposal ledgers are canonical outputs, not new evidence.
+    `COALESCE(p.frontmatter->>'gbrain_curated', 'false') <> 'true'`,
+    "octet_length(coalesce(p.compiled_truth, '')) <= 50000",
+  ];
+  const params: unknown[] = [promptVersion];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
     params.push(scope.sourceIds);
-    where.push(`source_id = ANY($${params.length}::text[])`);
+    where.push(`p.source_id = ANY($${params.length}::text[])`);
   } else if (scope.sourceId) {
     params.push(scope.sourceId);
-    where.push(`source_id = $${params.length}`);
+    where.push(`p.source_id = $${params.length}`);
   }
   params.push(limit);
   return engine.executeRaw<ProposeTakesPageRow>(
     `SELECT slug, source_id, compiled_truth
-       FROM pages
+       FROM pages p
       WHERE ${where.join(' AND ')}
-      ORDER BY updated_at DESC, id DESC
+      -- Unprocessed pages come first so a page limit cannot starve the tail
+      -- behind a permanently cached newest-page prefix.
+      ORDER BY ${alreadyProcessed} ASC, p.updated_at DESC, p.id DESC
       LIMIT $${params.length}`,
     params,
   );
@@ -642,7 +658,17 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const phaseStartMs = Date.now();
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
-    const modelId = opts.model ?? getChatModel();
+    // An injected extractor is a complete replacement for the gateway path;
+    // avoid touching global gateway config merely to manufacture a label.
+    let modelId = opts.model;
+    if (!modelId) {
+      try {
+        modelId = getChatModel();
+      } catch (error) {
+        if (!opts.extractor) throw error;
+        modelId = 'injected-extractor';
+      }
+    }
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /
@@ -730,7 +756,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
     }
 
     // Load pages eligible for proposal. Source-scoped per BaseCyclePhase.
-    const pages = await listCandidatePages(engine, scope, pageLimit);
+    const pages = await listCandidatePages(engine, scope, pageLimit, promptVersion);
 
     if (opts.reporter) {
       opts.reporter.start('propose_takes.pages' as never, pages.length);

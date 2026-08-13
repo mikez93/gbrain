@@ -20,6 +20,11 @@ import {
   resolveTakesRepoDir,
   TakesWriteError,
 } from '../takes-write.ts';
+import {
+  acceptTakeProposal,
+  listTakeProposals,
+  rejectTakeProposal,
+} from '../take-proposals.ts';
 
 // --- v0.28: Takes ---
 
@@ -73,6 +78,62 @@ const takes_search: Operation = {
     });
   },
   cliHints: { name: 'takes-search', positional: ['query'] },
+};
+
+const takes_propose_list: Operation = {
+  name: 'takes_propose_list',
+  description: 'List reviewed take proposals before promotion into canonical takes.',
+  scope: 'read',
+  params: {
+    limit: { type: 'number', description: 'Max rows (default 50, cap 500)' },
+    offset: { type: 'number', description: 'Skip first N rows' },
+    status: { type: 'string', description: 'pending | accepted | rejected | superseded (default pending)' },
+  },
+  handler: async (ctx, p) => {
+    return listTakeProposals(ctx.engine, {
+      limit: p.limit as number | undefined,
+      offset: p.offset as number | undefined,
+      status: p.status as 'pending' | 'accepted' | 'rejected' | 'superseded' | undefined,
+      ...sourceScopeOpts(ctx),
+      holdersAllowList: ctx.takesHoldersAllowList,
+    });
+  },
+};
+
+const takes_propose_accept: Operation = {
+  name: 'takes_propose_accept',
+  description: 'Accept one reviewed take proposal into the brain-private durable curation ledger, mirror it to DB, and stamp the proposal accepted.',
+  scope: 'write',
+  params: {
+    proposal_id: { type: 'number', required: true },
+  },
+  handler: async (ctx, p) => {
+    return acceptTakeProposal(ctx.engine, p.proposal_id as number, {
+      actedBy: ctx.auth?.clientName ?? 'mcp',
+      // Acceptance is a WRITE. Federated read grants never expand scalar
+      // write authority to neighboring sources.
+      sourceId: ctx.sourceId,
+      holdersAllowList: ctx.takesHoldersAllowList,
+    });
+  },
+};
+
+const takes_propose_reject: Operation = {
+  name: 'takes_propose_reject',
+  description: 'Reject one take proposal so review-first queues do not re-offer it.',
+  scope: 'write',
+  params: {
+    proposal_id: { type: 'number', required: true },
+    reason: { type: 'string', description: 'Optional review note retained with the rejected proposal.' },
+  },
+  handler: async (ctx, p) => {
+    return rejectTakeProposal(ctx.engine, p.proposal_id as number, {
+      actedBy: ctx.auth?.clientName ?? 'mcp',
+      reason: p.reason as string | undefined,
+      sourceId: ctx.sourceId,
+      holdersAllowList: ctx.takesHoldersAllowList,
+    });
+  },
 };
 
 /**
@@ -563,11 +624,11 @@ const takes_resolve: Operation = {
   },
 };
 
-// Ops in EXACTLY the canonical `operations` array order: the v0.28 trio
-// (takes_list, takes_search, think), the v0.30 calibration aggregates, then
-// the gap-closure write verbs.
+// Ops in EXACTLY the canonical `operations` array order.
 export const takesOperations: Operation[] = [
-  takes_list, takes_search, think,
+  takes_list, takes_search,
+  takes_propose_list, takes_propose_accept, takes_propose_reject,
+  think,
   takes_scorecard, takes_calibration,
   takes_add, takes_update, takes_resolve, takes_supersede,
 ];

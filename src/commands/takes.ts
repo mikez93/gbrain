@@ -28,10 +28,10 @@ import {
 import { resolveSourceId } from '../core/source-resolver.ts';
 import { resolveOwnerHolder } from '../core/owner-holder.ts';
 import {
-  listPendingProposals,
-  acceptProposal,
-  rejectProposal,
-  TakeProposalError,
+  acceptTakeProposal,
+  listTakeProposals,
+  repairAcceptedTakeProposals,
+  rejectTakeProposal,
 } from '../core/take-proposals.ts';
 
 // --- Helpers ---
@@ -479,8 +479,10 @@ async function cmdPropose(engine: BrainEngine, args: string[], sourceId: string)
   const json = flagPresent(args, '--json');
   const acceptRaw = flagValue(args, '--accept');
   const rejectRaw = flagValue(args, '--reject');
-  if (acceptRaw !== undefined && rejectRaw !== undefined) {
-    console.error('Error: --accept and --reject are mutually exclusive (choose one).');
+  const repairRequested = flagPresent(args, '--repair') || args[0] === 'repair';
+  const actionCount = Number(acceptRaw !== undefined) + Number(rejectRaw !== undefined) + Number(repairRequested);
+  if (actionCount > 1) {
+    console.error('Error: --accept, --reject, and --repair are mutually exclusive.');
     process.exit(1);
   }
 
@@ -497,19 +499,34 @@ async function cmdPropose(engine: BrainEngine, args: string[], sourceId: string)
     configValue: await engine.getConfig('emotional_weight.user_holder'),
   });
 
+  if (repairRequested) {
+    const result = await repairAcceptedTakeProposals(engine, { sourceId, actedBy });
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(
+      `Reconciled ${result.repaired}/${result.scanned} accepted proposal(s) from the private curation ledger` +
+      (result.failed.length > 0 ? `; ${result.failed.length} failed.` : '.'),
+    );
+    if (result.failed.length > 0) process.exitCode = 1;
+    return;
+  }
+
   if (acceptRaw !== undefined) {
     const id = parseId(acceptRaw, '--accept');
-    const dirArg = flagValue(args, '--dir');
-    const brainDir = await resolveBrainDir(engine, dirArg ?? null);
     try {
-      const { proposal, rowNum } = await acceptProposal({ engine, brainDir, sourceId, actedBy }, id);
-      console.log(`Accepted proposal #${id} → take #${rowNum} on ${proposal.page_slug}.`);
-    } catch (err) {
-      if (err instanceof TakeProposalError) {
-        console.error(err.message);
-        process.exit(1);
+      const result = await acceptTakeProposal(engine, id, { sourceId, actedBy });
+      if (json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
       }
-      exitTakesError(err);
+      const since = result.since_date ? ` since=${result.since_date}` : ' since=(unset: no real claim-date)';
+      const suffix = result.idempotent ? ' (already accepted)' : '';
+      console.log(`Accepted proposal #${id} → ${result.page_slug}#${result.row_num}${since}${suffix}.`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
     }
     return;
   }
@@ -517,14 +534,20 @@ async function cmdPropose(engine: BrainEngine, args: string[], sourceId: string)
   if (rejectRaw !== undefined) {
     const id = parseId(rejectRaw, '--reject');
     try {
-      const proposal = await rejectProposal({ engine, sourceId, actedBy }, id);
-      console.log(`Rejected proposal #${id} (${proposal.page_slug}).`);
-    } catch (err) {
-      if (err instanceof TakeProposalError) {
-        console.error(err.message);
-        process.exit(1);
+      const result = await rejectTakeProposal(engine, id, {
+        sourceId,
+        actedBy,
+        reason: flagValue(args, '--reason'),
+      });
+      if (json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
       }
-      throw err;
+      const suffix = result.idempotent ? ' (already rejected)' : '';
+      console.log(`Rejected proposal #${id}${suffix}.`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
     }
     return;
   }
@@ -536,7 +559,7 @@ async function cmdPropose(engine: BrainEngine, args: string[], sourceId: string)
     console.error(`Invalid --limit "${limitRaw}". Expected a positive integer.`);
     process.exit(1);
   }
-  const pending = await listPendingProposals(engine, { sourceId, limit });
+  const pending = await listTakeProposals(engine, { sourceId, limit, status: 'pending' });
   if (json) {
     console.log(JSON.stringify(pending, null, 2));
     return;
@@ -579,9 +602,9 @@ Subcommands:
                                           Record bet resolution (immutable, v0.30.0)
                                           Back-compat: --outcome true|false (deprecated alias)
   takes propose [--limit N] [--json]      List pending LLM-proposed takes (propose_takes queue)
-  takes propose --accept <id> [--dir <path>]
-                                          Promote a proposal into the page's takes fence
+  takes propose --accept <id>             Promote a proposal into the private curation ledger
   takes propose --reject <id>             Dismiss a proposal
+  takes propose --repair                  Rebuild accepted DB takes from the private ledger
   takes scorecard [<holder>] [--domain <prefix>] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]
                                           Aggregate calibration scorecard (v0.30.0)
   takes calibration [<holder>] [--bucket-size 0.1] [--json]
