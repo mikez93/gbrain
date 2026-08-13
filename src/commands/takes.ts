@@ -206,7 +206,10 @@ async function cmdPropose(engine: BrainEngine, args: string[]): Promise<void> {
     const status = flagValue(rest, '--status') as 'pending' | 'accepted' | 'rejected' | 'superseded' | undefined;
     const limit = parseInt(flagValue(rest, '--limit') ?? '30', 10);
     const offset = parseInt(flagValue(rest, '--offset') ?? '0', 10);
-    const rows = await listTakeProposals(engine, { status: status ?? 'pending', limit, offset });
+    const sourceId = await resolveTakesSourceId(engine);
+    const rows = await listTakeProposals(engine, {
+      status: status ?? 'pending', limit, offset, sourceId,
+    });
     if (json) {
       console.log(JSON.stringify(rows, null, 2));
       return;

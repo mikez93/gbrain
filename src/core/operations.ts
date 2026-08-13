@@ -2304,6 +2304,7 @@ const takes_propose_list: Operation = {
       holdersAllowList: ctx.takesHoldersAllowList,
     });
   },
+  cliHints: { name: 'takes-propose-list', hidden: true },
 };
 
 const takes_propose_accept: Operation = {
@@ -2322,6 +2323,7 @@ const takes_propose_accept: Operation = {
       holdersAllowList: ctx.takesHoldersAllowList,
     });
   },
+  cliHints: { name: 'takes-propose-accept', hidden: true },
 };
 
 const takes_propose_reject: Operation = {
@@ -2340,6 +2342,7 @@ const takes_propose_reject: Operation = {
       holdersAllowList: ctx.takesHoldersAllowList,
     });
   },
+  cliHints: { name: 'takes-propose-reject', hidden: true },
 };
 
 /**
