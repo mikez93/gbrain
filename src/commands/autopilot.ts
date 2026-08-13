@@ -193,15 +193,34 @@ export function resolveWindowsCliPath(): string {
  * resolves to) that already wraps the right runtime+entrypoint; prefer it.
  *
  * Order of resolution:
- *   1. Platform PATH lookup - `which gbrain` on POSIX; explicit %PATH%
+ *   1. Explicit `GBRAIN_BIN` runtime pin. Maintained deployments use this to
+ *      keep supervisor children on the same immutable release as the parent.
+ *      An invalid explicit pin fails closed instead of falling back to PATH.
+ *   2. Platform PATH lookup - `which gbrain` on POSIX; explicit %PATH%
  *      enumeration (resolveWindowsCliPath) on win32, where `which` does
  *      not exist (#3793).
- *   2. process.execPath if it ends with /gbrain (compiled binary, no shim).
- *   3. argv[1] if it ends with /gbrain (e.g., direct invocation of compiled
+ *   3. process.execPath if it ends with /gbrain (compiled binary, no shim).
+ *   4. argv[1] if it ends with /gbrain (e.g., direct invocation of compiled
  *      binary without PATH). Never .ts source paths.
- *   4. Throw with a clear install hint.
+ *   5. Throw with a clear install hint.
  */
 export function resolveGbrainCliPath(): string {
+  const explicit = process.env.GBRAIN_BIN;
+  if (explicit !== undefined) {
+    if (!isAbsolute(explicit)) {
+      throw new Error('GBRAIN_BIN must be an absolute path');
+    }
+    try {
+      const stat = statSync(explicit);
+      if (!stat.isFile() || (stat.mode & 0o111) === 0) {
+        throw new Error('not an executable regular file');
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`GBRAIN_BIN is unavailable or unsafe: ${reason}`);
+    }
+    return explicit;
+  }
   // #3793: `which` does not exist in cmd or PowerShell on Windows, so the
   // bun-installed gbrain.exe shim on %PATH% was never found and autopilot
   // died with "Could not resolve the gbrain CLI path". `where` would find
