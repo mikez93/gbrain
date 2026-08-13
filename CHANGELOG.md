@@ -555,6 +555,8 @@ The dreaded `RuntimeError: Aborted()` at startup — the one that made zero-conf
 
 Credit where due: @yang1996202-cpu (#2575), @AndreLYL (#223), and @roysaurav (#1670) for reports and diagnosis, the #223 thread contributors whose recoveries proved the root cause, and @yestheboxer, whose rejected upstream recovery PR (electric-sql/pglite#994) this port builds on.
 
+Standalone binaries produced by `bun build --compile` now retain every bundled schema pack. Pack inspection, validation, activation, inheritance, and the runtime enrichment gates use the same manifests as direct source execution, including when the binary or its checkout path contains spaces.
+
 ### To take advantage of v0.42.75.0
 
 ```bash
