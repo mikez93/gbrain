@@ -17,6 +17,25 @@ import { join } from 'path';
 import { withEnv } from './helpers/with-env.ts';
 
 describe('resolveGbrainCliPath', () => {
+  test('explicit GBRAIN_BIN wins over mutable PATH resolution', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-explicit-'));
+    const pinned = join(dir, 'gbrain');
+    try {
+      writeFileSync(pinned, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      await withEnv({ GBRAIN_BIN: pinned }, async () => {
+        expect(resolveGbrainCliPath()).toBe(pinned);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('invalid explicit GBRAIN_BIN fails closed instead of using PATH', async () => {
+    await withEnv({ GBRAIN_BIN: 'relative/gbrain' }, async () => {
+      expect(() => resolveGbrainCliPath()).toThrow(/absolute path/);
+    });
+  });
+
   test('returns a non-empty string or throws with a clear install hint', () => {
     let path: string;
     try {
