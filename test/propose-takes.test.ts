@@ -446,6 +446,33 @@ New prose appended here.`;
     expect((details.warnings as string[])[0]).toContain('LLM timeout');
   });
 
+  test('bounds page-level extractor concurrency while processing every candidate', async () => {
+    const pages = Array.from({ length: 12 }, (_, index) =>
+      buildPage({ slug: `wiki/parallel-${index}`, body: `page ${index} prose` }));
+    const { engine } = buildMockEngine({ pages });
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inFlight -= 1;
+      return [];
+    };
+
+    const result = await runPhaseProposeTakes(buildCtx(engine), {
+      extractor,
+      concurrency: 4,
+      pageLimit: 12,
+    });
+
+    expect(result.status).toBe('ok');
+    expect(peakInFlight).toBe(4);
+    expect(result.details.pages_scanned).toBe(12);
+    expect(result.details.concurrency).toBe(4);
+    expect(result.details.page_limit).toBe(12);
+  });
+
   test('pages with empty compiled_truth are skipped silently (no extractor call)', async () => {
     const pages = [
       buildPage({ slug: 'wiki/empty', body: '' }),

@@ -151,6 +151,8 @@ export interface ProposeTakesOpts extends BasePhaseOpts {
   repoPath?: string;
   /** Limit pages processed in this cycle (for triage / quick smoke). Default: 100. */
   pageLimit?: number;
+  /** Bounded page-level extractor concurrency. Default: 1. */
+  concurrency?: number;
   /** Inject the LLM call for tests; production uses gateway.chat. */
   extractor?: ProposeTakesExtractor;
   /** Override prompt_version (tests). */
@@ -207,6 +209,15 @@ interface ProposeTakesPageRow {
   slug: string;
   source_id: string;
   compiled_truth: string | null;
+}
+
+function positiveIntegerEnv(name: string, fallback: number, maximum: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed >= 1
+    ? Math.min(parsed, maximum)
+    : fallback;
 }
 
 /**
@@ -298,8 +309,15 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
   return rows;
 }
 
-/** Per-call wall-clock timeout for the extractor LLM call. */
-const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
+/**
+ * Per-call wall-clock timeout for the extractor LLM call.
+ *
+ * Sustained subscription-backed traffic can complete successfully beyond 90s.
+ * Aborting the client at 90s does not cancel an already-admitted upstream
+ * request, so it spends the inference while discarding the answer. Keep this
+ * below the gateway's 300s default, but above the observed healthy tail.
+ */
+const EXTRACTOR_CALL_TIMEOUT_MS = 180_000;
 
 /**
  * #3763 — output caps for the extractor call. A stopReason 'length' response
@@ -342,12 +360,27 @@ export async function defaultExtractor(
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
-  const call = (maxTokens: number) => gatewayChat({
-    messages: [{ role: 'user', content: prompt }],
-    ...(input.modelHint ? { model: input.modelHint } : {}),
-    maxTokens,
-    abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
-  });
+  const call = async (maxTokens: number) => {
+    // Bun's AbortSignal.timeout() can retain its timer after a compiled CLI
+    // request settles. Own and clear the timer so successful proposal runs do
+    // not keep the process — and its source lock — alive until the timeout.
+    const abortController = new AbortController();
+    const timeout = setTimeout(
+      () => abortController.abort(new Error('propose_takes extractor call timed out')),
+      EXTRACTOR_CALL_TIMEOUT_MS,
+    );
+    (timeout as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+    try {
+      return await gatewayChat({
+        messages: [{ role: 'user', content: prompt }],
+        ...(input.modelHint ? { model: input.modelHint } : {}),
+        maxTokens,
+        abortSignal: abortController.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
   let result = await call(PROPOSE_TAKES_MAX_TOKENS);
 
   // #3763: a truncated response (stopReason 'length' — e.g. reasoning tokens
@@ -588,7 +621,13 @@ class ProposeTakesPhase extends BaseCyclePhase {
 
     const extractor = opts.extractor ?? defaultExtractor;
     const promptVersion = opts.promptVersion ?? PROPOSE_TAKES_PROMPT_VERSION;
-    const pageLimit = opts.pageLimit ?? 100;
+    const pageLimit = opts.pageLimit
+      ?? positiveIntegerEnv('GBRAIN_PROPOSE_TAKES_PAGE_LIMIT', 100, 100_000);
+    const concurrency = Math.max(1, Math.min(
+      opts.concurrency
+        ?? positiveIntegerEnv('GBRAIN_PROPOSE_TAKES_CONCURRENCY', 1, 256),
+      256,
+    ));
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     // gbrain#4168: explicit test override wins; otherwise the REAL remaining
     // job budget (when the cycle threads deadlineAtMs) clamped to the derived
@@ -702,17 +741,31 @@ class ProposeTakesPhase extends BaseCyclePhase {
     // failures. A successful call resets the streak.
     const llmHalt = createGlobalLlmHaltTracker();
 
-    for (const page of pages) {
+    let nextPageIndex = 0;
+    const shouldStop = (): boolean =>
+      result.budget_exhausted
+      || result.deadline_hit === true
+      || result.aborted_global_error !== undefined
+      || result.aborted_failure_streak === true;
+
+    const processNextPage = async (): Promise<void> => {
+      while (true) {
+        if (shouldStop()) return;
+        const pageIndex = nextPageIndex++;
+        if (pageIndex >= pages.length) return;
+        const page = pages[pageIndex]!;
       // Phase deadline check. Break (not throw) so the phase returns a
       // partial result with deadline_hit:true; work already banked stays.
       const elapsedMs = Date.now() - phaseStartMs;
       if (elapsedMs > deadlineMs) {
-        result.warnings.push(
-          `phase deadline hit at page ${result.pages_scanned}/${pages.length} ` +
-          `after ${(elapsedMs / 1000).toFixed(0)}s (cap ${(deadlineMs / 1000).toFixed(0)}s); partial completion`,
-        );
-        result.deadline_hit = true;
-        break;
+        if (!result.deadline_hit) {
+          result.warnings.push(
+            `phase deadline hit at page ${result.pages_scanned}/${pages.length} ` +
+            `after ${(elapsedMs / 1000).toFixed(0)}s (cap ${(deadlineMs / 1000).toFixed(0)}s); partial completion`,
+          );
+          result.deadline_hit = true;
+        }
+        return;
       }
 
       result.pages_scanned += 1;
@@ -748,11 +801,13 @@ class ProposeTakesPhase extends BaseCyclePhase {
         maxOutputTokens: 500,
       });
       if (!budget.allowed) {
-        result.budget_exhausted = true;
-        result.warnings.push(
-          `budget exhausted at page ${result.pages_scanned}/${pages.length} (cumulative $${budget.cumulativeCostUsd.toFixed(4)} / cap $${budget.budgetUsd.toFixed(2)})`,
-        );
-        break;
+        if (!result.budget_exhausted) {
+          result.budget_exhausted = true;
+          result.warnings.push(
+            `budget exhausted at page ${result.pages_scanned}/${pages.length} (cumulative $${budget.cumulativeCostUsd.toFixed(4)} / cap $${budget.budgetUsd.toFixed(2)})`,
+          );
+        }
+        return;
       }
 
       // Call the extractor. Per-page errors log a warning and continue —
@@ -780,7 +835,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
             `aborting phase at page ${result.pages_scanned}/${pages.length}: ` +
             `${llmHalt.note()} (${detail})`,
           );
-          break;
+          return;
         }
         result.warnings.push(detail);
         // #3763: N consecutive failures with ZERO successes = dead lane.
@@ -797,7 +852,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
             `${result.llm_calls_failed} consecutive extractor failures with zero successes — ` +
             `halting to avoid re-billing every remaining page (no tombstones written; pages retry next cycle)`,
           );
-          break;
+          return;
         }
         continue;
       }
@@ -869,7 +924,11 @@ class ProposeTakesPhase extends BaseCyclePhase {
         );
         result.tombstones_written += 1;
       }
-    }
+      }
+    };
+
+    const workerCount = Math.min(concurrency, Math.max(1, pages.length));
+    await Promise.all(Array.from({ length: workerCount }, () => processNextPage()));
 
     if (opts.reporter) opts.reporter.finish();
 
@@ -932,7 +991,14 @@ class ProposeTakesPhase extends BaseCyclePhase {
           ? `; aborted after ${result.llm_calls_failed} consecutive extractor failures (zero successes)`
           : '') +
         (warningCount > 0 ? ` (${warningCount} warning(s))` : ''),
-      details: { ...result, halted, proposal_run_id: proposalRunId, prompt_version: promptVersion },
+      details: {
+        ...result,
+        halted,
+        proposal_run_id: proposalRunId,
+        prompt_version: promptVersion,
+        concurrency,
+        page_limit: pageLimit,
+      },
       status: phaseFailed ? 'fail' : halted || warningCount > 0 ? 'warn' : 'ok',
     };
   }
