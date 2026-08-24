@@ -377,7 +377,7 @@ describe('BudgetTracker.reserve', () => {
     expect((caught as BudgetExhausted).reason).toBe('no_pricing');
   });
 
-  test('#3628: unknown hosted rerank provider points no-pricing guidance at embedding-pricing', () => {
+  test('unknown hosted reranker points no-pricing guidance at the provider recipe', () => {
     const t = new BudgetTracker({ maxCostUsd: 1.0, label: 'test', auditPath });
     let caught: unknown = null;
     try {
@@ -392,7 +392,7 @@ describe('BudgetTracker.reserve', () => {
     }
     expect(caught).toBeInstanceOf(BudgetExhausted);
     expect((caught as BudgetExhausted).reason).toBe('no_pricing');
-    expect((caught as Error).message).toContain('embedding-pricing.ts');
+    expect((caught as Error).message).toContain('provider reranker recipe');
     expect((caught as Error).message).not.toContain('anthropic-pricing.ts');
   });
 
