@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 118 tools across 22 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 121 tools across 22 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -220,6 +220,9 @@ Every non-localOnly operation on the MCP surface: 118 tools across 22 areas. **S
 | `takes_add` | Record a take (typed claim) on a page: fact / take / bet / hunch, with a holder (who holds the belief: world, people/<slug>, companies/<slug>, or brain), weight 0..1, and optional source/since date. | write |  |  |
 | `takes_calibration` | Calibration curve: resolved correct/incorrect bets binned by stated weight; observed vs predicted per bucket. | read |  |  |
 | `takes_list` | List takes (typed/weighted/attributed claims) filtered by holder/kind/active/etc. | read |  |  |
+| `takes_propose_accept` | Accept one reviewed take proposal into the brain-private durable curation ledger, mirror it to DB, and stamp the proposal accepted. | write |  |  |
+| `takes_propose_list` | List reviewed take proposals before promotion into canonical takes. | read |  |  |
+| `takes_propose_reject` | Reject one take proposal so review-first queues do not re-offer it. | write |  |  |
 | `takes_resolve` | Resolve a take: quality correct / incorrect / partial / unresolvable, with optional evidence text and measured value/unit. | write |  |  |
 | `takes_scorecard` | Calibration scorecard for resolved bets: counts, accuracy, Brier (correct ∨ incorrect only), partial_rate. | read |  |  |
 | `takes_search` | Keyword search across takes (pg_trgm similarity over claim text) | read |  |  |
@@ -233,4 +236,3 @@ Every non-localOnly operation on the MCP surface: 118 tools across 22 areas. **S
 |---|---|---|---|---|
 | `add_timeline_entry` | Add timeline entry to a page. | write | yes |  |
 | `get_timeline` | Get timeline entries for a page, optionally filtered by date window | read |  |  |
-
