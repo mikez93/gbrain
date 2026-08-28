@@ -962,6 +962,14 @@ export interface HybridSearchOpts extends SearchOpts {
   _queryEmbedDeadline?: QueryEmbedDeadline;
 
   /**
+   * INTERNAL — the original query embedding already computed by
+   * `hybridSearchCached` for a semantic-cache lookup. On a miss, reuse it for
+   * the original text-vector arm instead of billing and waiting for the same
+   * provider call twice. Expansion variants still compute their own vectors.
+   */
+  _queryEmbedding?: Float32Array;
+
+  /**
    * Hermetic eval canaries/CI — non-semantic embeddings. When set, the query
    * embedding for the TEXT vector arm comes from this function (e.g. qrels
    * basis vectors) INSTEAD of the gateway's query-embed path, and the
@@ -1747,10 +1755,13 @@ export async function hybridSearch(
     // embeddings) replaces the gateway query-embed for the text vector arm.
     // No deadline needed — it's a synchronous-ish local computation with no
     // network. Absent queryEmbedFn, the bounded gateway path is unchanged.
-    const embedOneQuery = (q: string): Promise<Float32Array> =>
-      opts?.queryEmbedFn
-        ? Promise.resolve(opts.queryEmbedFn(q))
-        : embedQueryBounded(q, embedOpts, embedDl);
+    const embedOneQuery = (q: string): Promise<Float32Array> => {
+      if (opts?.queryEmbedFn) return Promise.resolve(opts.queryEmbedFn(q));
+      if (q === query && opts?._queryEmbedding) {
+        return Promise.resolve(opts._queryEmbedding);
+      }
+      return embedQueryBounded(q, embedOpts, embedDl);
+    };
     if (!searchSalvageEnabled()) {
       // ENG-7 kill switch (GBRAIN_SEARCH_SALVAGE=off): pre-wave
       // all-or-nothing fan-outs — one variant's failure abandons every
@@ -2515,6 +2526,9 @@ export async function hybridSearchCached(
     // v0.42.20.0 (Fix 3) — share the query-embed deadline so the inner embed
     // doesn't start a fresh 6s budget after the cache-lookup already spent it.
     _queryEmbedDeadline: queryEmbedDl,
+    // A cache miss already paid for the original query vector. Reuse that
+    // exact vector in the text arm; variants/cross-modal arms remain distinct.
+    ...(queryEmbedding ? { _queryEmbedding: queryEmbedding } : {}),
     // #2952 — classify this search's telemetry record (emitted by the inner
     // function) with the cache-consult outcome. 'hit' already returned above,
     // so only miss/disabled reach this call.

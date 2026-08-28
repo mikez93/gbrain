@@ -808,6 +808,12 @@ export interface SearchResult {
    */
   effective_date?: string | null;
   effective_date_source?: string | null;
+  /**
+   * Last persisted page update, normalized to an ISO-8601 timestamp by the
+   * search/query operation layer. This is ingestion freshness, not the
+   * page's semantic/event date (`effective_date`).
+   */
+  updated_at?: string | null;
   /** RFC 5322 Message-ID projected from allowlisted email frontmatter. */
   message_id?: string;
   /** Gmail thread id projected from allowlisted email frontmatter. */

@@ -18,7 +18,8 @@ import { expandQuery } from '../search/expansion.ts';
 import { dedupResults } from '../search/dedup.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
-import type { HybridSearchMeta } from '../types.ts';
+import type { HybridSearchMeta, SearchResult } from '../types.ts';
+import { isValidSourceId } from '../source-id.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
@@ -100,6 +101,87 @@ function normalizeTypesParam(raw: unknown): string[] | undefined {
   return types;
 }
 
+const MAX_EXACT_SOURCE_IDS = 64;
+
+/**
+ * Trusted-local exact multi-source scope for fleet routers and operator
+ * tooling. Remote callers already receive a server-built grant scope; they
+ * must not be able to replace it with caller-controlled source ids.
+ */
+function normalizeExactSourceIds(
+  ctx: OperationContext,
+  p: Record<string, unknown>,
+): string[] | undefined {
+  const raw = p.source_ids;
+  if (raw === undefined || raw === null) return undefined;
+  if (ctx.remote !== false) {
+    throw new OperationError(
+      'permission_denied',
+      '`source_ids` is reserved for trusted local callers.',
+      'Remote callers must use their server-assigned federated source grant.',
+    );
+  }
+  if (p.source_id !== undefined) {
+    throw new OperationError(
+      'invalid_params',
+      '`source_id` and `source_ids` are mutually exclusive.',
+    );
+  }
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_EXACT_SOURCE_IDS) {
+    throw new OperationError(
+      'invalid_params',
+      `\`source_ids\` must be a non-empty array of at most ${MAX_EXACT_SOURCE_IDS} source ids.`,
+    );
+  }
+  if (raw.some((value) => !isValidSourceId(value))) {
+    throw new OperationError(
+      'invalid_params',
+      '`source_ids` contains an invalid source id.',
+      'Use 1-32 lowercase alphanumeric characters with optional interior hyphens.',
+    );
+  }
+  return [...new Set(raw as string[])];
+}
+
+const SOURCE_IDS_PARAM_DESCRIPTION =
+  'Trusted-local only: search exactly these source ids in one ranked retrieval. ' +
+  'Remote callers use their server-assigned grant. Mutually exclusive with source_id.';
+
+/**
+ * Search rows carry semantic/event dates from ranking SQL. Hydrate the
+ * distinct page update timestamps once after ranking so operators can assess
+ * ingestion freshness without issuing N follow-up get_page calls.
+ */
+async function stampPageUpdatedAt(
+  ctx: OperationContext,
+  results: SearchResult[],
+): Promise<void> {
+  const pageIds = [...new Set(results.map((r) => r.page_id).filter(Number.isFinite))];
+  if (pageIds.length === 0) return;
+  try {
+    const rows = await ctx.engine.executeRaw<{ id: number; updated_at: Date | string | null }>(
+      'SELECT id, updated_at FROM pages WHERE id = ANY($1::int[])',
+      [pageIds],
+    );
+    const byId = new Map<number, string | null>();
+    for (const row of rows) {
+      const raw = row.updated_at;
+      const normalized = raw === null
+        ? null
+        : raw instanceof Date
+          ? raw.toISOString()
+          : new Date(raw).toISOString();
+      byId.set(Number(row.id), normalized);
+    }
+    for (const result of results) {
+      if (byId.has(result.page_id)) result.updated_at = byId.get(result.page_id) ?? null;
+    }
+  } catch {
+    // Freshness telemetry is additive. A legacy-schema/read failure must not
+    // turn a useful retrieval into an outage; absence remains honest.
+  }
+}
+
 const TYPES_PARAM_DESCRIPTION =
   "Filter results to pages whose `type` is in this list (e.g. ['person','company']). " +
   'CLI: --types person,company. Applied at SQL level on every retrieval leg — the same ' +
@@ -144,6 +226,7 @@ const search: Operation = {
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
     // #3800: subagent token economy — per-call snippet cap.
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
+    source_ids: { type: 'array', items: { type: 'string' }, description: SOURCE_IDS_PARAM_DESCRIPTION },
   },
   handler: async (ctx, p) => {
     const startedAt = Date.now();
@@ -155,7 +238,8 @@ const search: Operation = {
     // #3800: snippet cap (param > subagent config default > full text).
     const snippetCap = await resolveSnippetCap(ctx, p);
     // #2561: unqualified trusted-local search spans federated sources.
-    const scope = federatedSearchScope(ctx);
+    const exactSourceIds = normalizeExactSourceIds(ctx, p);
+    const scope = exactSourceIds ? { sourceIds: exactSourceIds } : federatedSearchScope(ctx);
     // #4352 — untrusted callers never see `visibility: private` pages
     // (config-gated; trusted local CLI unchanged).
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
@@ -186,6 +270,7 @@ const search: Operation = {
       // to cancel on this path — keyword-only never applies the compiled-
       // truth boost — but the provenance marker must still surface).
       await stampUnverifiedExtractions(ctx.engine, results);
+      await stampPageUpdatedAt(ctx, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
       ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, null, { conceptHint: true }));
@@ -207,6 +292,7 @@ const search: Operation = {
       onMeta: (m) => { capturedMeta = m; },
     });
     stampDeepResearchIds(results);
+    await stampPageUpdatedAt(ctx, results);
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
@@ -284,6 +370,7 @@ const query: Operation = {
       description:
         "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to span every source for trusted local callers; for remote callers '__all__' spans only your granted sources.",
     },
+    source_ids: { type: 'array', items: { type: 'string' }, description: SOURCE_IDS_PARAM_DESCRIPTION },
     cross_modal: {
       type: 'string',
       enum: ['text', 'image', 'both', 'auto'],
@@ -346,7 +433,10 @@ const query: Operation = {
     const sourceIdParam = typeof p.source_id === 'string' ? p.source_id : undefined;
     // #2561: unqualified trusted-local query spans federated sources (per-call
     // source_id / remote grants still resolve through resolveRequestedScope).
-    const querySourceScope = federatedSearchScope(ctx, sourceIdParam);
+    const exactSourceIds = normalizeExactSourceIds(ctx, p);
+    const querySourceScope = exactSourceIds
+      ? { sourceIds: exactSourceIds }
+      : federatedSearchScope(ctx, sourceIdParam);
     // #4352 — same enforcement for the full-control query op (both the image
     // searchVector branch and the text hybrid path below).
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
@@ -539,6 +629,7 @@ const query: Operation = {
         }
       }
     }
+    await stampPageUpdatedAt(ctx, results);
     const latency_ms = Date.now() - startedAt;
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
