@@ -147,6 +147,75 @@ const SOURCE_IDS_PARAM_DESCRIPTION =
   'Trusted-local only: search exactly these source ids in one ranked retrieval. ' +
   'Remote callers use their server-assigned grant. Mutually exclusive with source_id.';
 
+const MAX_QUERY_EMBEDDING_DIMENSIONS = 16_384;
+const FLEET_ROUTER_CLIENT_NAME =
+  /^brain-router-[a-z][a-z0-9_-]{0,63}-[0-9a-f]{12}$/;
+
+function isFleetRouterContext(ctx: OperationContext): boolean {
+  return ctx.remote === true
+    && typeof ctx.auth?.clientName === 'string'
+    && FLEET_ROUTER_CLIENT_NAME.test(ctx.auth.clientName)
+    && ctx.auth.scopes.includes('read');
+}
+
+/**
+ * Accept a precomputed query vector only from trusted local calls or the
+ * operator-provisioned, read-only fleet-router OAuth clients. Remote source
+ * scope still comes exclusively from the server-side OAuth grant; this field
+ * can change ranking work, never which sources the caller may read.
+ */
+export function normalizeTrustedQueryEmbedding(
+  ctx: OperationContext,
+  raw: unknown,
+): Float32Array | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const fleetRouter = isFleetRouterContext(ctx);
+  if (ctx.remote !== false && !fleetRouter) {
+    throw new OperationError(
+      'permission_denied',
+      '`query_embedding` is reserved for the maintainer fleet router.',
+    );
+  }
+  const expected = ctx.config.embedding_dimensions;
+  if (
+    !Number.isInteger(expected)
+    || (expected as number) < 1
+    || (expected as number) > MAX_QUERY_EMBEDDING_DIMENSIONS
+    || !Array.isArray(raw)
+    || raw.length !== expected
+    || raw.some((value) => typeof value !== 'number' || !Number.isFinite(value))
+  ) {
+    throw new OperationError(
+      'invalid_params',
+      '`query_embedding` must be a finite numeric vector matching this brain.',
+    );
+  }
+  return Float32Array.from(raw as number[]);
+}
+
+const QUERY_EMBEDDING_PARAM_DESCRIPTION =
+  'Maintainer fleet-router only: a precomputed query vector matching this brain.';
+
+function normalizeFleetRouterKeywordFallback(
+  ctx: OperationContext,
+  raw: unknown,
+): boolean {
+  if (raw === undefined || raw === null || raw === false) return false;
+  if (raw !== true) {
+    throw new OperationError('invalid_params', '`router_keyword_fallback` must be boolean.');
+  }
+  if (!isFleetRouterContext(ctx)) {
+    throw new OperationError(
+      'permission_denied',
+      '`router_keyword_fallback` is reserved for the maintainer fleet router.',
+    );
+  }
+  return true;
+}
+
+const ROUTER_KEYWORD_FALLBACK_PARAM_DESCRIPTION =
+  'Maintainer fleet-router only: bounded lexical fallback when the shared embedding is unavailable.';
+
 /**
  * Search rows carry semantic/event dates from ranking SQL. Hydrate the
  * distinct page update timestamps once after ranking so operators can assess
@@ -227,6 +296,8 @@ const search: Operation = {
     // #3800: subagent token economy — per-call snippet cap.
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
     source_ids: { type: 'array', items: { type: 'string' }, description: SOURCE_IDS_PARAM_DESCRIPTION },
+    query_embedding: { type: 'array', items: { type: 'number' }, description: QUERY_EMBEDDING_PARAM_DESCRIPTION },
+    router_keyword_fallback: { type: 'boolean', description: ROUTER_KEYWORD_FALLBACK_PARAM_DESCRIPTION },
   },
   handler: async (ctx, p) => {
     const startedAt = Date.now();
@@ -239,6 +310,11 @@ const search: Operation = {
     const snippetCap = await resolveSnippetCap(ctx, p);
     // #2561: unqualified trusted-local search spans federated sources.
     const exactSourceIds = normalizeExactSourceIds(ctx, p);
+    const queryEmbedding = normalizeTrustedQueryEmbedding(ctx, p.query_embedding);
+    const routerKeywordFallback = normalizeFleetRouterKeywordFallback(
+      ctx,
+      p.router_keyword_fallback,
+    );
     const scope = exactSourceIds ? { sourceIds: exactSourceIds } : federatedSearchScope(ctx);
     // #4352 — untrusted callers never see `visibility: private` pages
     // (config-gated; trusted local CLI unchanged).
@@ -252,7 +328,8 @@ const search: Operation = {
     // T4/D17 — escape hatch: keyword-only when the operator opts out of the
     // hybrid `search` contract (privacy/cost: no query text to an embedding
     // provider). Defaults to cheap-hybrid (D4/D15).
-    const keywordOnly = (await ctx.engine.getConfig('search.mcp_keyword_only')) === 'true';
+    const keywordOnly = routerKeywordFallback
+      || (await ctx.engine.getConfig('search.mcp_keyword_only')) === 'true';
 
     if (keywordOnly) {
       const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, excludePrivate, ...(types ? { types } : {}), ...scope });
@@ -288,6 +365,11 @@ const search: Operation = {
       excludePrivate,
       ...(types ? { types } : {}),
       ...scope,
+      ...(queryEmbedding ? {
+        _queryEmbedding: queryEmbedding,
+        useCache: false,
+        reranker: { enabled: false, topNIn: 30, topNOut: null },
+      } : {}),
       ...(perCallMode ? { mode: perCallMode } : {}),
       onMeta: (m) => { capturedMeta = m; },
     });

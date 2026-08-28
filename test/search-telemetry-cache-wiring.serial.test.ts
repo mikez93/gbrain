@@ -154,6 +154,15 @@ beforeEach(async () => {
 });
 
 describe('hybridSearchCached — telemetry carries the cache outcome', () => {
+  test('a precomputed vector is reused for cache lookup and the search arm', async () => {
+    const results = await hybridSearchCached(engine, 'alice precomputed vector', {
+      limit: 5,
+      _queryEmbedding: fixedEmbedding(),
+    });
+    expect(results.length).toBeGreaterThan(0);
+    expect(embedCalls).toBe(0);
+  });
+
   test('miss then hit: one record per search, classified, hit keeps results/rank-1 telemetry', async () => {
     // Call 1 — cache consulted, empty → miss.
     const first = await hybridSearchCached(engine, 'alice telemetry fixtures', { limit: 5 });

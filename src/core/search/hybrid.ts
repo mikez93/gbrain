@@ -1646,7 +1646,7 @@ export async function hybridSearch(
   //   - 'image': embedQueryMultimodal + searchVector(embedding_image), skip keyword
   //   - 'both': text + image vector searches in parallel; merged via weighted RRF
   let vectorLists: SearchResult[][] = [];
-  let queryEmbedding: Float32Array | null = null;
+  let queryEmbedding: Float32Array | null = opts?._queryEmbedding ?? null;
   let imageVectorList: SearchResult[] | null = null;
   let crossModalFellOpen = false;
 
@@ -2399,7 +2399,7 @@ export async function hybridSearchCached(
   // if it misses — but the embedding helper isn't cheap, so we only
   // attempt it when the cache is enabled AND the gateway has an embedding
   // provider configured.
-  let queryEmbedding: Float32Array | null = null;
+  let queryEmbedding: Float32Array | null = opts?._queryEmbedding ?? null;
   // v0.42.20.0 (Fix 3, #1775) — ONE shared query-embed deadline for the
   // cache-lookup embed below AND the inner hybridSearch embed (threaded via
   // opts._queryEmbedDeadline). On a stalled provider the cache-lookup embed
@@ -2407,7 +2407,7 @@ export async function hybridSearchCached(
   // sees the already-elapsed budget and fails fast → keyword fallback. Worst
   // case ~one timeout (~6s), comfortably under the CLI 10s force-exit.
   const queryEmbedDl = makeQueryEmbedDeadline();
-  if (!skipCache) {
+  if (!skipCache && !queryEmbedding) {
     try {
       const { isAvailable } = await import('../ai/gateway.ts');
       // v0.36 (D10): for the cache-lookup embedding, also use the resolved
