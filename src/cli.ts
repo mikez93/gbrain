@@ -1446,11 +1446,25 @@ export async function makeContext(engine: BrainEngine, params: Record<string, un
   // params.source is set when a CLI flag was parsed for the op (rare; most
   // CLI ops don't take --source). Falls through to env/dotfile/path-match.
   const explicit = (params.source as string | undefined) ?? null;
-  const { resolveSourceWithTier, localFederatedSourceIds, SourceTargetError } = await import('./core/source-resolver.ts');
+  const {
+    resolveSourceWithTier,
+    resolveExactSourceIds,
+    localFederatedSourceIds,
+    SourceTargetError,
+  } = await import('./core/source-resolver.ts');
   try {
-    const resolved = await resolveSourceWithTier(engine, explicit);
-    sourceId = resolved.source_id;
-    localFederated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
+    const exactSourceIds = await resolveExactSourceIds(engine, params.source_ids);
+    if (exactSourceIds) {
+      // Explicit multi-source reads outrank ambient single-source routing.
+      // The operation handler consumes params.source_ids; the context carries
+      // the same exact set so no later local fallback can widen it.
+      sourceId = exactSourceIds[0];
+      localFederated = exactSourceIds;
+    } else {
+      const resolved = await resolveSourceWithTier(engine, explicit);
+      sourceId = resolved.source_id;
+      localFederated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
+    }
   } catch (err) {
     // #1712: an EXPLICIT --source that fails to resolve (invalid id, or a
     // source that doesn't exist) must error loudly — the blanket swallow
@@ -1459,7 +1473,7 @@ export async function makeContext(engine: BrainEngine, params: Record<string, un
     // Ambient user-selected targets (GBRAIN_SOURCE / .gbrain-source /
     // sources.default) are just as authoritative as --source. Only structural
     // pre-init failures retain the legacy default fallback.
-    if (explicit || err instanceof SourceTargetError) throw err;
+    if (explicit || params.source_ids !== undefined || err instanceof SourceTargetError) throw err;
     // Ambient resolution failed (e.g. sources table doesn't exist on a fresh
     // pre-init brain). Leave sourceId unset; engine read methods fall through
     // to the cross-source view (D16 back-compat path).

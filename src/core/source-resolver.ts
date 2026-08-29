@@ -334,6 +334,36 @@ async function assertSourceExists(engine: BrainEngine, id: string): Promise<void
   }
 }
 
+const MAX_EXACT_SOURCE_IDS = 64;
+
+/**
+ * Validate and resolve the trusted-local `source_ids` scope used by search
+ * and query before ambient single-source routing is consulted. An explicit
+ * exact scope is authoritative: a deliberately invalid GBRAIN_SOURCE
+ * tripwire must not block a command that already names every source it will
+ * read. Each id is still required to be syntactically valid, active, and
+ * registered, so the bypass cannot widen or silently retarget the read.
+ */
+export async function resolveExactSourceIds(
+  engine: BrainEngine,
+  raw: unknown,
+): Promise<string[] | undefined> {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_EXACT_SOURCE_IDS) {
+    throw new SourceTargetError(
+      `source_ids must be a non-empty array of at most ${MAX_EXACT_SOURCE_IDS} source ids.`,
+    );
+  }
+  if (raw.some((value) => !isValidSourceId(value))) {
+    throw new SourceTargetError(
+      'source_ids contains an invalid source id. Use 1-32 lowercase alphanumeric characters with optional interior hyphens.',
+    );
+  }
+  const sourceIds = [...new Set(raw as string[])];
+  for (const id of sourceIds) await assertSourceExists(engine, id);
+  return sourceIds;
+}
+
 /**
  * #3765 — resolve the source id for an EXPLICIT repo path (`sync --repo <dir>`
  * / the sync_brain op's `repo` param), anchored at the REPO DIR instead of

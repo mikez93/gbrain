@@ -33,6 +33,7 @@ beforeEach(async () => {
   await engine.executeRaw(
     `INSERT INTO sources (id, name, archived)
      VALUES ('active-target', 'active-target', false),
+            ('second-target', 'second-target', false),
             ('archived-target', 'archived-target', true)`,
   );
 });
@@ -89,5 +90,29 @@ describe('CLI ambient source routing fails closed', () => {
       `SELECT source_id FROM pages WHERE slug = 'receipts/positive-control'`,
     );
     expect(rows).toEqual([{ source_id: 'active-target' }]);
+  });
+
+  test('GREEN positive: explicit source_ids outrank an invalid ambient tripwire', async () => {
+    const ctx = await withEnv({ GBRAIN_SOURCE: 'does-not-exist' }, () => makeContext(engine, {
+      source_ids: ['active-target', 'second-target', 'active-target'],
+    }));
+    expect(ctx.sourceId).toBe('active-target');
+    expect(ctx.localFederatedSourceIds).toEqual(['active-target', 'second-target']);
+  });
+
+  test('RED negative: explicit source_ids remain fail-closed for missing sources', async () => {
+    await withEnv({ GBRAIN_SOURCE: 'does-not-exist' }, async () => {
+      await expect(makeContext(engine, {
+        source_ids: ['active-target', 'missing-target'],
+      })).rejects.toThrow(/missing-target.*not found|not found.*missing-target/i);
+    });
+  });
+
+  test('RED negative: malformed explicit source_ids fail before ambient routing', async () => {
+    await withEnv({ GBRAIN_SOURCE: 'active-target' }, async () => {
+      await expect(makeContext(engine, {
+        source_ids: ['NOT_VALID'],
+      })).rejects.toThrow(/invalid source id/i);
+    });
   });
 });
