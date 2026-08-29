@@ -45,6 +45,7 @@ import { isTitlePhraseMatch } from './title-match.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { stampEvidence, markKeywordHits } from './evidence.ts';
 import { applyExactLookupTier } from './exact-lookup.ts';
+import { readDispositionGeneration, stampPageDispositions } from '../disposition/search.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
 import { enforceTokenBudget, searchSalvageEnabled, type TokenBudgetMeta } from './token-budget.ts';
 import { warnOncePerProcess } from '../utils.ts';
@@ -852,7 +853,12 @@ export async function applyAliasHop(
   engine: import('../engine.ts').BrainEngine,
   results: SearchResult[],
   query: string,
-  opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean },
+  opts: {
+    sourceId?: string;
+    sourceIds?: string[];
+    excludePrivate?: boolean;
+    dispositionScope?: 'competing' | 'curation';
+  },
 ): Promise<SearchResult[]> {
   if (!query) return results;
   const qNorm = normalizeAlias(query);
@@ -899,6 +905,8 @@ export async function applyAliasHop(
       opts.excludePrivate &&
       ((page.frontmatter as Record<string, unknown> | null | undefined)?.visibility === 'private')
     ) continue;
+    const { pageCompetes } = await import('../disposition/search.ts');
+    if (!await pageCompetes(engine, ref.source_id, ref.slug, opts.dispositionScope ?? 'competing')) continue;
     injectScore += 1e-6;
     out.push({
       // #2339-sibling: include page_id. The `as SearchResult` cast hid its
@@ -1253,6 +1261,7 @@ export async function hybridSearch(
     // let an untrusted caller read `visibility: private` pages through the
     // hybrid hot path.
     excludePrivate: opts?.excludePrivate,
+    dispositionScope: opts?.dispositionScope ?? 'competing',
     // v0.36 (D11): pass the pre-validated descriptor into the engine so
     // it never has to read config. Engines normalize string-or-descriptor
     // via normalizeEngineColumn; the descriptor path is the strict one.
@@ -1440,6 +1449,7 @@ export async function hybridSearch(
       // straight from pages — thread the caller's private-page gate or a
       // remote relational query bypasses the keyword/vector visibility clause.
       excludePrivate: opts?.excludePrivate,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
       onMeta: opts?.onRelationalMeta,
     });
   }
@@ -1503,12 +1513,14 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
       excludePrivate: opts?.excludePrivate,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
     });
     // #1663 — structural exact-lookup tier (slug / exact-title identity).
     const noEmbedHopped = await applyExactLookupTier(engine, noEmbedPreExact, query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
       titleCandidates: titleResults,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
     });
     stampEvidence(noEmbedHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
     // #3995 — guaranteed page-1 relational evidence: a fired arm's answer is
@@ -1528,6 +1540,7 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, noEmbedBudgeted);
+    await stampPageDispositions(engine, noEmbedBudgeted);
     lastResultsCount = noEmbedBudgeted.length;
     lastRank1Score = noEmbedBudgeted[0] ? (noEmbedBudgeted[0].base_score ?? noEmbedBudgeted[0].score) : undefined;
     // WP2/T3 — no silent bypass: the keyword-only-config branch names why
@@ -1893,18 +1906,21 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
       excludePrivate: opts?.excludePrivate,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
     });
     // #1663 — structural exact-lookup tier (slug / exact-title identity).
     const kwHopped = await applyExactLookupTier(engine, kwPreExact, query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
       titleCandidates: titleResults,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
     });
     stampEvidence(kwHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
     const kwSliced = kwHopped.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, kwBudgeted);
+    await stampPageDispositions(engine, kwBudgeted);
     lastResultsCount = kwBudgeted.length;
     lastRank1Score = kwBudgeted[0] ? (kwBudgeted[0].base_score ?? kwBudgeted[0].score) : undefined;
     // WP2/T3 — the embed/vector failure that emptied vectorLists already
@@ -2093,6 +2109,7 @@ export async function hybridSearch(
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
     excludePrivate: opts?.excludePrivate,
+    dispositionScope: opts?.dispositionScope ?? 'competing',
   });
 
   // #1663 — structural exact-lookup tier: a query that IS a page identity
@@ -2105,6 +2122,7 @@ export async function hybridSearch(
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
     titleCandidates: titleResults,
+    dispositionScope: opts?.dispositionScope ?? 'competing',
   });
 
   // T4 — stamp evidence + create_safety so the agent's don't-duplicate
@@ -2198,6 +2216,7 @@ export async function hybridSearch(
   // the same budget behavior as the production query op.
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, resolvedMode.tokenBudget);
   await stampContentFlags(engine, budgeted);
+  await stampPageDispositions(engine, budgeted);
   lastResultsCount = budgeted.length;
   lastRank1Score = budgeted[0] ? (budgeted[0].base_score ?? budgeted[0].score) : undefined;
   stampBudgetStage(degraded, budgetMeta);
@@ -2305,7 +2324,7 @@ export async function hybridSearchCached(
 
   // Cache key carries the column + provider so different embedding spaces
   // never collide on the same `(source_id, query_text)` row.
-  const cacheKnobsHash = knobsHash(resolvedForCache, {
+  const baseCacheKnobsHash = knobsHash(resolvedForCache, {
     embeddingColumn: resolvedColCached.name,
     embeddingModel: resolvedColCached.embeddingModel,
     // #2825 — fold the resolved hard-exclude prefix list (defaults ∪
@@ -2329,6 +2348,9 @@ export async function hybridSearchCached(
     // private-included call.
     excludePrivate: opts?.excludePrivate === true,
   });
+  const dispositionScope = opts?.dispositionScope ?? 'competing';
+  const dispositionGeneration = await readDispositionGeneration(engine);
+  const cacheKnobsHash = `${baseCacheKnobsHash}:ds=${dispositionScope}:dg=${dispositionGeneration}`;
 
   // Cache decision: opts.useCache (explicit) wins over global config; global
   // config wins over mode bundle default. Mode bundle is on for all 3 modes

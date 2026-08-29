@@ -55,6 +55,7 @@ export {
 
 import { pagesOperations } from './ops/pages.ts';
 import { searchOperations } from './ops/search.ts';
+import { dispositionOperations } from './ops/dispositions.ts';
 import { takesOperations } from './ops/takes.ts';
 import { tagsOperations } from './ops/tags.ts';
 import { linksOperations } from './ops/links.ts';
@@ -130,6 +131,8 @@ export const operations: Operation[] = [
   ...pagesOperations,
   // Search (search, query) — ops/search.ts
   ...searchOperations,
+  // Authenticated owner-curation ledger (set/read/reverse + bounded batches).
+  ...dispositionOperations,
   // v0.36 Phase 2: image-as-query (search_by_image) — ops/image.ts
   ...imageOperations,
   // Tags (add_tag, remove_tag, get_tags) — ops/tags.ts
@@ -237,6 +240,11 @@ const OP_AREAS: Record<string, string> = {
   fetch: 'pages', // #4039 deep-research read adapter (search/fetch pair)
   // search
   search: 'search', query: 'search', search_by_image: 'search',
+  // reversible owner curation
+  set_page_disposition: 'dispositions', set_duplicate_set: 'dispositions',
+  set_disposition_batch: 'dispositions', reverse_page_disposition: 'dispositions',
+  reverse_duplicate_set: 'dispositions', reverse_disposition_batch: 'dispositions',
+  get_page_disposition: 'dispositions', list_page_dispositions: 'dispositions',
   // tags
   add_tag: 'tags', remove_tag: 'tags', get_tags: 'tags',
   // links + graph

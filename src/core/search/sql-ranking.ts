@@ -18,6 +18,7 @@
  */
 
 import { quarantineFilterFragment } from '../quarantine.ts';
+import { dispositionVisibilityClause } from '../disposition/search.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
 import { privatePagesFilterFragment } from './private-visibility.ts';
 
@@ -183,6 +184,7 @@ export function buildVisibilityClause(
      * are unchanged.
      */
     excludePrivate?: boolean;
+    dispositionScope?: 'competing' | 'curation';
   },
 ): string {
   // Single source of truth for the quarantine SQL lives in quarantine.ts so
@@ -193,7 +195,8 @@ export function buildVisibilityClause(
   const privateClause = opts?.excludePrivate
     ? ` AND ${privatePagesFilterFragment(pageAlias)}`
     : '';
-  return `AND ${pageAlias}.deleted_at IS NULL AND NOT ${sourceAlias}.archived AND ${quarantine}${privateClause}`;
+  const dispositionClause = dispositionVisibilityClause(pageAlias, opts?.dispositionScope ?? 'competing');
+  return `AND ${pageAlias}.deleted_at IS NULL AND NOT ${sourceAlias}.archived AND ${quarantine}${privateClause}${dispositionClause}`;
 }
 
 // ============================================================

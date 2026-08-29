@@ -55,7 +55,11 @@ import type { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 // initSchema time by PGLITE_SCHEMA_SQL; TRUNCATEing the table breaks
 // page_generation_counter.test.ts AND any test that reads the clock value
 // after a reset. Production never truncates the clock table.
-const PRESERVE_TABLES = new Set(['schema_version', 'page_generation_clock']);
+const PRESERVE_TABLES = new Set([
+  'schema_version',
+  'page_generation_clock',
+  'page_disposition_state',
+]);
 
 export async function resetPgliteState(engine: PGLiteEngine): Promise<void> {
   const rows = await engine.executeRaw<{ tablename: string }>(
@@ -73,5 +77,8 @@ export async function resetPgliteState(engine: PGLiteEngine): Promise<void> {
     `INSERT INTO sources (id, name, config)
        VALUES ('default', 'default', '{"federated": true}'::jsonb)
        ON CONFLICT (id) DO NOTHING`,
+  );
+  await engine.executeRaw(
+    `UPDATE page_disposition_state SET generation = 0 WHERE id = 1`,
   );
 }

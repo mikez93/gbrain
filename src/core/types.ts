@@ -752,6 +752,13 @@ export interface SearchResult {
   chunk_index: number;
   score: number;
   stale: boolean;
+  /** Reversible owner-curation state for the result's page. */
+  disposition?: {
+    state: 'undispositioned' | 'canonical' | 'superseded' | 'quarantined';
+    duplicate_set_id: string | null;
+    canonical: { source_id: string; slug: string } | null;
+    last_event_id: number | null;
+  };
   /**
    * v0.42 (issue #1699) content-quality gate agent-warning channel. Set
    * when the result's page carries a `frontmatter.content_flag` marker
@@ -1038,6 +1045,8 @@ export interface ResolvedColumn {
 export interface SearchOpts {
   limit?: number;
   offset?: number;
+  /** Ordinary retrieval excludes superseded/quarantined pages; curation includes them. */
+  dispositionScope?: 'competing' | 'curation';
   /**
    * v0.46.15 — out-channel for searchVector's bounded pagination escalation
    * (retrieval-cathedral P1: one dense page could consume the whole inner
@@ -1421,6 +1430,8 @@ export interface RelationalFanoutRow {
 
 /** Options for BrainEngine.relationalFanout. */
 export interface RelationalFanoutOpts {
+  /** Ordinary retrieval excludes superseded/quarantined pages before LIMIT. */
+  dispositionScope?: 'competing' | 'curation';
   /** Edge types to traverse; null/empty = type-agnostic. */
   linkTypes?: string[] | null;
   /** Direction from each seed. Default 'both'. */

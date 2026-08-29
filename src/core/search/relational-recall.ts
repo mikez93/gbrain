@@ -45,6 +45,7 @@ export interface RelationalArmOpts {
    * without it a remote relational query leaked private titles + snippets.
    */
   excludePrivate?: boolean;
+  dispositionScope?: 'competing' | 'curation';
   onMeta?: (meta: RelationalArmMeta) => void;
 }
 
@@ -117,6 +118,7 @@ async function hydrate(
   rows: RelationalFanoutRow[],
   seedSlug: string,
   excludePrivate: boolean,
+  dispositionScope: 'competing' | 'curation',
 ): Promise<SearchResult[]> {
   if (rows.length === 0) return [];
   const slugs = Array.from(new Set(rows.map(r => r.slug)));
@@ -127,7 +129,7 @@ async function hydrate(
             LEFT(p.compiled_truth, 240) AS synopsis
      FROM pages p
      JOIN sources s ON s.id = p.source_id
-     WHERE p.slug = ANY($1::text[]) ${buildVisibilityClause('p', 's', { excludePrivate })}`,
+     WHERE p.slug = ANY($1::text[]) ${buildVisibilityClause('p', 's', { excludePrivate, dispositionScope })}`,
     [slugs],
   );
   const byKey = new Map<string, typeof pageRows[number]>();
@@ -277,6 +279,7 @@ export async function buildRelationalArm(
       direction: parsed.direction,
       depth: opts.depth,
       limit: opts.limit,
+      dispositionScope: opts.dispositionScope ?? 'competing',
     };
 
     if (parsed.kind === 'connects' && parsed.seeds.length === 2) {
@@ -304,7 +307,13 @@ export async function buildRelationalArm(
         .map(r => ({ row: r, combined: r.hop + bByKey.get(`${r.source_id}:${r.slug}`)!.hop }))
         .sort((x, y) => x.combined - y.combined || x.row.slug.localeCompare(y.row.slug))
         .map(x => x.row);
-      const list = await hydrate(engine, shared, parsed.seeds.join(' ↔ '), opts.excludePrivate === true);
+      const list = await hydrate(
+        engine,
+        shared,
+        parsed.seeds.join(' ↔ '),
+        opts.excludePrivate === true,
+        opts.dispositionScope ?? 'competing',
+      );
       meta.fired = list.length > 0;
       return finish(list);
     }
@@ -320,7 +329,13 @@ export async function buildRelationalArm(
       sourceId: srcIds.length === 1 ? srcIds[0] : undefined,
       sourceIds: srcIds.length > 1 ? srcIds : undefined,
     });
-    const list = await hydrate(engine, rows, resolved[0].slug, opts.excludePrivate === true);
+    const list = await hydrate(
+      engine,
+      rows,
+      resolved[0].slug,
+      opts.excludePrivate === true,
+      opts.dispositionScope ?? 'competing',
+    );
     meta.fired = list.length > 0;
     return finish(list);
   } catch (err) {

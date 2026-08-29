@@ -36,6 +36,7 @@ import type { SearchResult } from '../types.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { isLookupShapedQuery } from './query-intent.ts';
 import { applySupersedeDownrank } from './hybrid.ts';
+import { pageCompetes } from '../disposition/search.ts';
 
 /** Cap on tier injections per query (mirrors the alias hop's discipline). */
 export const MAX_EXACT_LOOKUP_INJECT = 3;
@@ -51,6 +52,7 @@ export function isSlugShapedQuery(query: string): boolean {
 export interface ExactLookupOpts {
   sourceId?: string;
   sourceIds?: string[];
+  dispositionScope?: 'competing' | 'curation';
   /**
    * The page-grain title arm hybridSearch already fetched (searchTitles
    * output). The title probe filters THIS list to normalized full-title
@@ -99,12 +101,14 @@ export async function structuralExactLookup(
           ? await engine.getPage(q, { sourceId: scope })
           : await engine.getPage(q); // gbrain-allow-unscoped-getpage — read-only first-match; no paired write
         if (!page) continue;
+        const sourceId = page.source_id ?? scope ?? 'default';
+        if (!await pageCompetes(engine, sourceId, page.slug, opts.dispositionScope ?? 'competing')) continue;
         push({
           page_id: page.id,
           slug: page.slug,
           title: page.title,
           type: page.type,
-          source_id: page.source_id ?? scope ?? 'default',
+          source_id: sourceId,
           chunk_text: (page.compiled_truth ?? '').slice(0, 200),
           chunk_index: 0,
           chunk_id: 0,

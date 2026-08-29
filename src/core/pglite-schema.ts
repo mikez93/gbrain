@@ -24,6 +24,7 @@
 import { applyChunkEmbeddingIndexPolicy } from './vector-index.ts';
 import { applyFtsLanguagePolicy } from './fts-language.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
+import { PAGE_DISPOSITION_SCHEMA_SQL } from './disposition/schema.ts';
 
 const PGLITE_SCHEMA_SQL_TEMPLATE = `
 -- GBrain PGLite schema (local embedded Postgres)
@@ -1178,9 +1179,10 @@ export function getPGLiteSchema(
     throw new Error(`Invalid embedding dimensions: ${dims}`);
   }
   const sanitizedModel = String(model).replace(/'/g, "''");
-  return applyFtsLanguagePolicy(applyChunkEmbeddingIndexPolicy(PGLITE_SCHEMA_SQL_TEMPLATE, parsedDims))
+  const baseSchema = applyFtsLanguagePolicy(applyChunkEmbeddingIndexPolicy(PGLITE_SCHEMA_SQL_TEMPLATE, parsedDims))
     .replace(/__EMBEDDING_DIMS__/g, String(parsedDims))
     .replace(/__EMBEDDING_MODEL__/g, sanitizedModel);
+  return `${baseSchema}\n${PAGE_DISPOSITION_SCHEMA_SQL}`;
 }
 
 /** Back-compat: pre-computed default-1536 schema for existing callers. */

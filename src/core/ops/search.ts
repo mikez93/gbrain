@@ -25,9 +25,11 @@ import { isValidSourceId } from '../source-id.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
+import { stampPageDispositions } from '../disposition/search.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
+import { resolveDispositionScope } from './dispositions.ts';
 import {
   federatedSearchScope,
   resolvePerCallMode,
@@ -348,6 +350,7 @@ const search: Operation = {
     source_ids: { type: 'array', items: { type: 'string' }, description: SOURCE_IDS_PARAM_DESCRIPTION },
     query_embedding: { type: 'array', items: { type: 'number' }, description: QUERY_EMBEDDING_PARAM_DESCRIPTION },
     router_keyword_fallback: { type: 'boolean', description: ROUTER_KEYWORD_FALLBACK_PARAM_DESCRIPTION },
+    disposition_scope: { type: 'string', enum: ['competing', 'curation'], description: 'Page competition scope. Defaults to competing; authenticated durable fleet roles may request curation to include superseded/quarantined rows.' },
   },
   handler: async (ctx, p) => {
     const startedAt = Date.now();
@@ -365,6 +368,7 @@ const search: Operation = {
       ctx,
       p.router_keyword_fallback,
     );
+    const dispositionScope = resolveDispositionScope(ctx, p.disposition_scope);
     const scope = exactSourceIds ? { sourceIds: exactSourceIds } : federatedSearchScope(ctx);
     // #4352 — untrusted callers never see `visibility: private` pages
     // (config-gated; trusted local CLI unchanged).
@@ -382,7 +386,7 @@ const search: Operation = {
       || (await ctx.engine.getConfig('search.mcp_keyword_only')) === 'true';
 
     if (keywordOnly) {
-      const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, excludePrivate, ...(types ? { types } : {}), ...scope });
+      const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, excludePrivate, dispositionScope, ...(types ? { types } : {}), ...scope });
       const deduped = dedupResults(raw);
       const fallbackReranker = routerKeywordFallback
         ? await resolvePrecomputedQueryReranker(ctx, perCallMode, limit)
@@ -411,6 +415,7 @@ const search: Operation = {
       // to cancel on this path — keyword-only never applies the compiled-
       // truth boost — but the provenance marker must still surface).
       await stampUnverifiedExtractions(ctx.engine, results);
+      await stampPageDispositions(ctx.engine, results);
       await stampPageUpdatedAt(ctx, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false, fallbackMeta);
@@ -431,6 +436,7 @@ const search: Operation = {
       offset,
       expansion: false,
       excludePrivate,
+      dispositionScope,
       ...(types ? { types } : {}),
       ...scope,
       ...(queryEmbedding ? {
@@ -557,6 +563,7 @@ const query: Operation = {
       description:
         "v0.43 — relational recall arm. SMART DEFAULT (on in balanced/tokenmax). When the question is about a RELATIONSHIP ('who invested in widget-co', 'who introduced me to alice', 'what connects fund-a and fund-b'), the brain resolves the named entity and walks its typed-edge graph (invested_in, works_at, founded, …), surfacing the answer even when no passage mentions both sides. Pure no-op for non-relational questions. Pass FALSE to force lexical/vector-only retrieval (e.g. debugging why a graph answer appeared). You almost never set this.",
     },
+    disposition_scope: { type: 'string', enum: ['competing', 'curation'], description: 'Page competition scope. Defaults to competing; authenticated durable fleet roles may request curation to include superseded/quarantined rows.' },
   },
   handler: async (ctx, p) => {
     const startedAt = Date.now();
@@ -590,6 +597,7 @@ const query: Operation = {
     // #4352 — same enforcement for the full-control query op (both the image
     // searchVector branch and the text hybrid path below).
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+    const dispositionScope = resolveDispositionScope(ctx, p.disposition_scope);
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
@@ -608,9 +616,11 @@ const query: Operation = {
         offset: (p.offset as number) || 0,
         embeddingColumn: 'embedding_image',
         excludePrivate,
+        dispositionScope,
         ...(types ? { types } : {}),
         ...querySourceScope,
       });
+      await stampPageDispositions(ctx.engine, results);
       return applySnippetCap(results, snippetCap);
     }
 
@@ -642,6 +652,7 @@ const query: Operation = {
       limit: (p.limit as number) || 20,
       offset: (p.offset as number) || 0,
       excludePrivate,
+      dispositionScope,
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
       // T4/D5 — per-call mode (local/trusted only; remote ignored).
@@ -714,6 +725,7 @@ const query: Operation = {
             relationalRetrieval: true,
             autocut: false,
             detail,
+            dispositionScope,
             // Preserve the caller's #3985 type filter on the re-run (raw
             // pass-through; the base call already rejected malformed input).
             ...(Array.isArray(p.types) || typeof p.types === 'string'

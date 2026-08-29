@@ -1999,7 +1999,7 @@ export class PostgresEngine implements BrainEngine {
     if (hasCJK(query)) {
       return this._searchKeywordCJK(query, {
         limit, offset, innerLimit, sourceFactorCase, hardExcludeClause,
-        visibilityClause: buildVisibilityClause('p', 's'),
+        visibilityClause: buildVisibilityClause('p', 's', { dispositionScope: opts?.dispositionScope ?? 'competing' }),
         detailFilter: detailLow ? `AND cc.chunk_source = 'compiled_truth'` : '',
         opts, dedup: true,
       });
@@ -2071,7 +2071,10 @@ export class PostgresEngine implements BrainEngine {
     // archived sources. Joined `sources s` lets the predicate compile to a
     // column lookup. NOT bypassed by detail=high — soft-delete is a contract,
     // not a temporal preference.
-    const visibilityClause = buildVisibilityClause('p', 's', { excludePrivate: opts?.excludePrivate === true });
+    const visibilityClause = buildVisibilityClause('p', 's', {
+      excludePrivate: opts?.excludePrivate === true,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
+    });
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
     // — safe to interpolate into raw SQL.
     const ftsLang = getFtsLanguage();
@@ -2178,7 +2181,10 @@ export class PostgresEngine implements BrainEngine {
     const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
-    const visibilityClause = buildVisibilityClause('p', 's', { excludePrivate: opts?.excludePrivate === true });
+    const visibilityClause = buildVisibilityClause('p', 's', {
+      excludePrivate: opts?.excludePrivate === true,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
+    });
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
     // — safe to interpolate into raw SQL.
     const ftsLang = getFtsLanguage();
@@ -2326,7 +2332,7 @@ export class PostgresEngine implements BrainEngine {
         limit, offset,
         innerLimit: 0,             // unused on chunk-grain (no inner CTE)
         sourceFactorCase, hardExcludeClause,
-        visibilityClause: buildVisibilityClause('p', 's'),
+        visibilityClause: buildVisibilityClause('p', 's', { dispositionScope: opts?.dispositionScope ?? 'competing' }),
         detailFilter: detailLow ? `AND cc.chunk_source = 'compiled_truth'` : '',
         opts, dedup: false,
       });
@@ -2388,7 +2394,10 @@ export class PostgresEngine implements BrainEngine {
     const offsetParam = `$${params.length}`;
 
     // v0.26.5: visibility filter for searchKeywordChunks (anchor primitive).
-    const visibilityClause = buildVisibilityClause('p', 's', { excludePrivate: opts?.excludePrivate === true });
+    const visibilityClause = buildVisibilityClause('p', 's', {
+      excludePrivate: opts?.excludePrivate === true,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
+    });
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
     // — safe to interpolate into raw SQL.
     const ftsLang = getFtsLanguage();
@@ -2570,7 +2579,10 @@ export class PostgresEngine implements BrainEngine {
     // sees the same row count it always did. Pulling the predicate to the
     // outer SELECT would force the HNSW scan to over-fetch and post-filter,
     // wasting candidate slots on hidden rows.
-    const visibilityClause = buildVisibilityClause('p', 's', { excludePrivate: opts?.excludePrivate === true });
+    const visibilityClause = buildVisibilityClause('p', 's', {
+      excludePrivate: opts?.excludePrivate === true,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
+    });
 
     // v0.36 Phase 3: 'embedding_multimodal' is the unified column populated
     // by `gbrain reindex --multimodal`. Carries BOTH text and image content
@@ -4126,6 +4138,7 @@ export class PostgresEngine implements BrainEngine {
     const direction = opts?.direction ?? 'both';
     const limit = Math.min(Math.max(1, opts?.limit ?? 50), 200);
     const types = opts?.linkTypes && opts.linkTypes.length > 0 ? opts.linkTypes : null;
+    const includeNoncompeting = opts?.dispositionScope === 'curation';
 
     // Scope is applied to SEED selection only. Within-source traversal is
     // enforced separately by `p2.source_id = w.seed_source` in the recursive
@@ -4158,6 +4171,10 @@ export class PostgresEngine implements BrainEngine {
                p.source_id AS seed_source, NULL::text AS last_link_type
         FROM pages p
         WHERE p.slug = ANY(${seeds}::text[]) ${seedScope} AND p.deleted_at IS NULL
+          AND (${includeNoncompeting} OR NOT EXISTS (
+            SELECT 1 FROM page_dispositions d
+            WHERE d.page_id = p.id AND d.state IN ('superseded', 'quarantined')
+          ))
         UNION ALL
         SELECT p2.id, p2.slug, p2.source_id, w.depth + 1,
                w.visited || p2.id, w.path || p2.slug,
@@ -4168,6 +4185,10 @@ export class PostgresEngine implements BrainEngine {
           AND NOT (p2.id = ANY(w.visited))
           AND p2.source_id = w.seed_source
           AND p2.deleted_at IS NULL
+          AND (${includeNoncompeting} OR NOT EXISTS (
+            SELECT 1 FROM page_dispositions d
+            WHERE d.page_id = p2.id AND d.state IN ('superseded', 'quarantined')
+          ))
           ${mentionsFilter}
           ${typeFilter}
       )

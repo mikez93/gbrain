@@ -10,6 +10,7 @@ import {
 } from './retry-matcher.ts';
 import { repairTimelineDedupIndex, repairLegacyTimelineSourceRows } from './timeline-dedup-repair.ts';
 import { repairPagesUpsertArbiter } from './pages-upsert-arbiter.ts';
+import { PAGE_DISPOSITION_SCHEMA_SQL } from './disposition/schema.ts';
 
 /**
  * When true, per-migration explanatory notices (e.g. the v123/v124 "here is
@@ -6205,6 +6206,30 @@ export const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_minion_jobs_queue_status_updated
         ON minion_jobs (queue, status, updated_at);
     `,
+  },
+  {
+    version: 142,
+    name: 'reversible_page_disposition',
+    // Owner curation plane: immutable operations/events, current projection,
+    // durable cache generation, and hard guards against deleting/archiving an
+    // active canonical. One SQL shape runs on Postgres and PGLite.
+    idempotent: true,
+    sql: PAGE_DISPOSITION_SCHEMA_SQL,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ n: number }>(
+        `SELECT COUNT(*)::int AS n
+         FROM information_schema.tables
+         WHERE table_schema = 'public'
+           AND table_name = ANY($1::text[])`,
+        [[
+          'page_disposition_operations',
+          'page_disposition_events',
+          'page_dispositions',
+          'page_disposition_state',
+        ]],
+      );
+      return Number(rows[0]?.n ?? 0) === 4;
+    },
   },
 ];
 

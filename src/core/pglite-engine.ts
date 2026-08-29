@@ -2338,7 +2338,10 @@ export class PGLiteEngine implements BrainEngine {
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
 
     // v0.26.5: visibility filter (soft-deleted + archived-source).
-    const visibilityClause = buildVisibilityClause('p', 's', { excludePrivate: opts?.excludePrivate === true });
+    const visibilityClause = buildVisibilityClause('p', 's', {
+      excludePrivate: opts?.excludePrivate === true,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
+    });
 
     // v0.32.7: CJK query branch. PGLite uses websearch_to_tsquery('english')
     // which can't tokenize CJK; queries return empty. Switch to ILIKE on
@@ -2474,7 +2477,10 @@ export class PGLiteEngine implements BrainEngine {
     const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
-    const visibilityClause = buildVisibilityClause('p', 's', { excludePrivate: opts?.excludePrivate === true });
+    const visibilityClause = buildVisibilityClause('p', 's', {
+      excludePrivate: opts?.excludePrivate === true,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
+    });
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
     // — safe to interpolate into raw SQL.
     const ftsLang = getFtsLanguage();
@@ -2629,7 +2635,10 @@ export class PGLiteEngine implements BrainEngine {
     const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
-    const visibilityClause = buildVisibilityClause('p', 's', { excludePrivate: opts?.excludePrivate === true });
+    const visibilityClause = buildVisibilityClause('p', 's', {
+      excludePrivate: opts?.excludePrivate === true,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
+    });
 
     // v0.32.7: CJK branch (same as searchKeyword but without page-dedup).
     if (hasCJK(query)) {
@@ -2788,7 +2797,10 @@ export class PGLiteEngine implements BrainEngine {
 
     // v0.26.5: visibility filter applied in the inner CTE so HNSW sees the
     // same candidate count it always did. See postgres-engine.ts for rationale.
-    const visibilityClause = buildVisibilityClause('p', 's', { excludePrivate: opts?.excludePrivate === true });
+    const visibilityClause = buildVisibilityClause('p', 's', {
+      excludePrivate: opts?.excludePrivate === true,
+      dispositionScope: opts?.dispositionScope ?? 'competing',
+    });
 
     // v0.36 (D11): column routing via resolved descriptor. Engine doesn't
     // read config — caller resolved at hybrid/op boundary. The cast SQL
@@ -4250,6 +4262,18 @@ export class PGLiteEngine implements BrainEngine {
     const direction = opts?.direction ?? 'both';
     const limit = Math.min(Math.max(1, opts?.limit ?? 50), 200);
     const types = opts?.linkTypes && opts.linkTypes.length > 0 ? opts.linkTypes : null;
+    const dispositionSeedFilter = opts?.dispositionScope === 'curation'
+      ? ''
+      : `AND NOT EXISTS (
+           SELECT 1 FROM page_dispositions d
+           WHERE d.page_id = p.id AND d.state IN ('superseded', 'quarantined')
+         )`;
+    const dispositionStepFilter = opts?.dispositionScope === 'curation'
+      ? ''
+      : `AND NOT EXISTS (
+           SELECT 1 FROM page_dispositions d
+           WHERE d.page_id = p2.id AND d.state IN ('superseded', 'quarantined')
+         )`;
 
     // $1=seeds, $2=depth, $3=limit; optional scope/type params appended.
     const params: unknown[] = [seeds, depth, limit];
@@ -4284,6 +4308,7 @@ export class PGLiteEngine implements BrainEngine {
                p.source_id AS seed_source, NULL::text AS last_link_type
         FROM pages p
         WHERE p.slug = ANY($1::text[]) ${seedScope} AND p.deleted_at IS NULL
+          ${dispositionSeedFilter}
         UNION ALL
         SELECT p2.id, p2.slug, p2.source_id, w.depth + 1,
                w.visited || p2.id, w.path || p2.slug,
@@ -4294,6 +4319,7 @@ export class PGLiteEngine implements BrainEngine {
           AND NOT (p2.id = ANY(w.visited))
           AND p2.source_id = w.seed_source
           AND p2.deleted_at IS NULL
+          ${dispositionStepFilter}
           ${mentionsFilter}
           ${typeFilter}
       )
