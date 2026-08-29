@@ -4,17 +4,17 @@
 # the same commit as any peel (the guard fails on >50 lines of stale slack).
 # Columns: path	max_lines	policy	note
 src/commands/doctor.ts	4422	ratchet	grown v0.46.26.0 megawave: silent-death checks, self-upgrade honesty, noise pruning (#3944 #3925 #3958)
-src/core/operations.ts	315	ratchet	peel target: containment sprint C4-C7; grown v0.46.26.0 megawave op wiring
-src/core/postgres-engine.ts	6166	ratchet	grown v0.46.26.0 megawave (#4218 #3986 #4352) + master v0.46.26.0 private-queue token bootstrap probe
-src/core/pglite-engine.ts	6062	ratchet	grown v0.46.26.0 megawave parity twins + master v0.46.26.0 private-queue columns
-src/core/migrate.ts	687	region-exempt	append-only MIGRATIONS array grows freely; runner logic is ratcheted — grown v0.46.26.0: repair-handler hooks (#3957 pages-upsert-arbiter)
+src/core/operations.ts	323	ratchet	peel target: containment sprint C4-C7; grown by downstream v0.46.28 disposition operation wiring
+src/core/postgres-engine.ts	6187	ratchet	grown by downstream v0.46.28 reversible disposition ledger implementation
+src/core/pglite-engine.ts	6088	ratchet	grown by downstream v0.46.28 reversible disposition parity implementation
+src/core/migrate.ts	688	region-exempt	append-only MIGRATIONS array grows freely; runner logic is ratcheted — downstream v0.46.28 disposition repair registration
 src/commands/sync.ts	4512	ratchet	grown v0.46.26.0 megawave: image sync, ingest-log gating, dry-run purity, checkpoint honesty (#2683 #4342 #3875) + 3 nosemgrep dataflow annotations (path-traversal audit)
 src/core/ai/gateway.ts	4561	ratchet	grown v0.46.26.0 megawave plus Kepler OpenRouter Voyage reranker compatibility
-src/cli.ts	3723	ratchet	grown v0.46.26.0 megawave: SIGCHLD reaper install, silent-failure surfacing, confirm-race gate (#2443 #2898 #2297)
+src/cli.ts	3737	ratchet	grown by downstream v0.46.28 disposition CLI and exact source_ids-before-ambient routing
 src/core/cycle.ts	3171	ratchet	grown v0.46.26.0 megawave (#4102 #2608) + master v0.46.26.0 cycle-start orphan recovery
 src/commands/serve-http.ts	3294	ratchet	grown v0.46.25.0 D2: /mcp per-request teardown (#2844)
 src/commands/jobs.ts	3111	ratchet	grown v0.46.26.0 megawave (#4098 #2308) + master v0.46.26.0 worker startup recovery + stats gating
-src/core/search/hybrid.ts	2859	ratchet	grown v0.46.28 fleet retrieval: reuse a validated maintainer query embedding across exact database fan-out
+src/core/search/hybrid.ts	2881	ratchet	grown v0.46.28 fleet retrieval and downstream disposition-aware search metadata
 src/core/engine.ts	2495	ratchet	grown v0.46.26.0 megawave: relational/visibility/usage contract surface (#4352 #4218)
 src/commands/autopilot.ts	2660	ratchet	grown v0.46.26.0 megawave plus Kepler immutable GBRAIN_BIN worker pin
 src/commands/extract.ts	2332	ratchet	grown v0.46.26.0 megawave: FS-walk stamp snapshot + legacy timeline repair wiring (#3957 D4)
@@ -22,7 +22,7 @@ src/commands/extract-conversation-facts.ts	2045	ratchet	grown v0.46.x per-provid
 src/core/import-file.ts	2142	ratchet	grown v0.46.26.0 megawave: OCR budget + image import + embed-retry rewire (#3973 #3374)
 src/core/cycle/synthesize.ts	2792	ratchet	merged waves; grown v0.46.26.0 megawave + master rolling lease via shared throttled renewer
 src/commands/embed.ts	1896	ratchet	lowered v0.46.26.0: embedBatchWithBackoff + retry cluster peeled to core/embed-retry.ts (core/commands layering fix)
-src/core/types.ts	1952	ratchet	grown v0.46.28 fleet retrieval: expose persisted page freshness on exact-source search rows
+src/core/types.ts	1963	ratchet	grown v0.46.28 fleet retrieval and downstream disposition response types
 src/commands/skillpack.ts	1360	ratchet
 src/core/minions/queue.ts	2442	ratchet	grown #4078 + megawave probe-liveness unlatch (#4310) + master private-queue lifecycle: recovery classifier + monotonic lease
 src/commands/init.ts	1950	ratchet	grown v0.46.x keyless capability notices

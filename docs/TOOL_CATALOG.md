@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 121 tools across 22 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 129 tools across 23 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -51,6 +51,19 @@ Every non-localOnly operation on the MCP surface: 121 tools across 22 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `request_tools` | Discover this brain's tool catalog and optionally unlock a wider tool surface for your client. | read | yes |  |
+
+## dispositions
+
+| Tool | Description | Scope | Starter | Gate |
+|---|---|---|---|---|
+| `get_page_disposition` | Read one page current disposition plus bounded newest-first immutable event history; never returns the page body. | read |  |  |
+| `list_page_dispositions` | List bounded current page dispositions in one authorized source with generation and a stable cursor; never returns page bodies. | read |  |  |
+| `reverse_disposition_batch` | Atomically compensate every event in one exact set_batch operation with one reversal receipt. | write |  |  |
+| `reverse_duplicate_set` | Atomically compensate every member event in one exact set_duplicate_set operation. | write |  |  |
+| `reverse_page_disposition` | Append a compensating event for one page current disposition event. | write |  |  |
+| `set_disposition_batch` | Atomically apply either native disposition groups or prepared owner page-ID records with one durable receipt and no partial writes. | write |  |  |
+| `set_duplicate_set` | Atomically choose one canonical page and supersede named members across sources in the same authenticated brain. | write |  |  |
+| `set_page_disposition` | Set one live page canonical, superseded, or quarantined through the append-only owner-curation ledger. | write |  |  |
 
 ## entities
 
