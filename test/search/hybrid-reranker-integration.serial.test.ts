@@ -29,7 +29,7 @@ import {
   resetGateway,
   __setEmbedTransportForTests,
 } from '../../src/core/ai/gateway.ts';
-import type { PageInput, SearchOpts } from '../../src/core/types.ts';
+import type { HybridSearchMeta, PageInput, SearchOpts } from '../../src/core/types.ts';
 import type { RerankInput, RerankResult } from '../../src/core/ai/gateway.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -173,6 +173,33 @@ describe('hybridSearchCached — email metadata through vector-first fusion', ()
 });
 
 describe('hybridSearch — reranker enabled (reorder)', () => {
+  test('emits positive provider/model/candidate proof without an audit lookup', async () => {
+    let meta: HybridSearchMeta | undefined;
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      autocut: false,
+      onMeta: (value) => { meta = value; },
+      reranker: {
+        enabled: true,
+        topNIn: 25,
+        topNOut: null,
+        model: 'openrouter:voyageai/rerank-2.5-lite',
+        rerankerFn: async (input: RerankInput): Promise<RerankResult[]> =>
+          input.documents.map((_, i) => ({ index: i, relevanceScore: 1 - i * 0.1 })),
+      },
+    });
+
+    expect(out.length).toBeGreaterThan(0);
+    expect(meta?.rerank).toEqual({
+      applied: true,
+      provider: 'openrouter',
+      model: 'openrouter:voyageai/rerank-2.5-lite',
+      candidate_pool_requested: 25,
+      candidates_in: out.length,
+      candidates_out: out.length,
+    });
+  });
+
   test('rerankerFn receives a non-empty document list', async () => {
     let receivedDocs: string[] = [];
     const opts: SearchOpts = {
@@ -281,17 +308,27 @@ describe('hybridSearch — reranker enabled (reorder)', () => {
 
 describe('hybridSearch — fail-open contract end-to-end', () => {
   test('rerankerFn throws → results still come back (RRF order preserved)', async () => {
+    let meta: HybridSearchMeta | undefined;
     const baseline = await hybridSearch(engine, 'alpha keyword', { limit: 10 });
     const reranked = await hybridSearch(engine, 'alpha keyword', {
       limit: 10,
+      onMeta: (value) => { meta = value; },
       reranker: {
         enabled: true,
         topNIn: 30,
         topNOut: null,
+        model: 'openrouter:voyageai/rerank-2.5-lite',
         rerankerFn: async () => { throw new Error('upstream down'); },
       },
     });
     // Same items, same order — applyReranker fail-open.
     expect(reranked.map(r => r.slug)).toEqual(baseline.map(r => r.slug));
+    expect(meta?.rerank).toMatchObject({
+      applied: false,
+      provider: 'openrouter',
+      model: 'openrouter:voyageai/rerank-2.5-lite',
+      candidates_in: reranked.length,
+      candidates_out: 0,
+    });
   });
 });

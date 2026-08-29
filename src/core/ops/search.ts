@@ -16,9 +16,11 @@ import {
 } from '../search/crag.ts';
 import { expandQuery } from '../search/expansion.ts';
 import { dedupResults } from '../search/dedup.ts';
+import { applyReranker } from '../search/rerank.ts';
+import { buildRerankProof } from '../search/rerank-proof.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
-import type { HybridSearchMeta, SearchResult } from '../types.ts';
+import type { HybridSearchMeta, SearchOpts, SearchResult } from '../types.ts';
 import { isValidSourceId } from '../source-id.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
@@ -64,6 +66,7 @@ function buildRetrievalResponseMeta(
       expansion_applied: m.expansion_applied,
       ...(m.cache ? { cache: m.cache.status } : {}),
       ...(m.token_budget ? { token_budget: m.token_budget } : {}),
+      ...(m.rerank ? { rerank: m.rerank } : {}),
       ...(m.degraded !== undefined ? { degraded: m.degraded } : {}),
     } : {}),
     ...(hint ? { hint } : {}),
@@ -148,6 +151,7 @@ const SOURCE_IDS_PARAM_DESCRIPTION =
   'Remote callers use their server-assigned grant. Mutually exclusive with source_id.';
 
 const MAX_QUERY_EMBEDDING_DIMENSIONS = 16_384;
+const MIN_FLEET_ROUTER_CANDIDATE_POOL = 25;
 const FLEET_ROUTER_CLIENT_NAME =
   /^brain-router-[a-z][a-z0-9_-]{0,63}-[0-9a-f]{12}$/;
 
@@ -196,7 +200,7 @@ export function normalizeTrustedQueryEmbedding(
 const QUERY_EMBEDDING_PARAM_DESCRIPTION =
   'Maintainer fleet-router only: a precomputed query vector matching this brain.';
 
-function normalizeFleetRouterKeywordFallback(
+export function normalizeFleetRouterKeywordFallback(
   ctx: OperationContext,
   raw: unknown,
 ): boolean {
@@ -262,6 +266,52 @@ const SNIPPET_CHARS_PARAM_DESCRIPTION =
   'the agent.search_snippet_chars config (300; 0=full); every other caller gets full text. (#3800)';
 
 /**
+ * Fleet-router OAuth clients may select only a quality-preserving mode. Other
+ * remote clients keep the original contract: their caller-supplied mode is
+ * ignored and server configuration wins.
+ */
+export function resolveSearchModeForCaller(
+  ctx: OperationContext,
+  raw: unknown,
+): string | undefined {
+  if (!isFleetRouterContext(ctx)) return resolvePerCallMode(ctx, raw);
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  if (raw !== 'balanced' && raw !== 'tokenmax') {
+    throw new OperationError(
+      'invalid_params',
+      "Fleet-router search mode must be 'balanced' or 'tokenmax'.",
+    );
+  }
+  return raw;
+}
+
+/** Resolve the DB-plane reranker recipe for a shared-embedding search. */
+export async function resolvePrecomputedQueryReranker(
+  ctx: OperationContext,
+  mode: string | undefined,
+  limit: number,
+): Promise<NonNullable<SearchOpts['reranker']>> {
+  const { loadSearchModeConfig, resolveSearchMode } = await import('../search/mode.ts');
+  const modeInput = await loadSearchModeConfig(ctx.engine);
+  const resolvedMode = resolveSearchMode({
+    mode: mode ?? modeInput.mode,
+    overrides: modeInput.overrides,
+  });
+  const fleetRouter = isFleetRouterContext(ctx);
+  return {
+    enabled: fleetRouter ? true : resolvedMode.reranker_enabled,
+    topNIn: Math.max(
+      resolvedMode.reranker_top_n_in,
+      limit,
+      fleetRouter ? MIN_FLEET_ROUTER_CANDIDATE_POOL : 0,
+    ),
+    topNOut: null,
+    model: resolvedMode.reranker_model,
+    timeoutMs: resolvedMode.reranker_timeout_ms,
+  };
+}
+
+/**
  * #3800: resolve the effective snippet cap for one call. Explicit
  * `snippet_chars` param wins (0 = full text); else subagent callers
  * (ctx.viaSubagent — fail-closed dispatcher flag) read the
@@ -290,7 +340,7 @@ const search: Operation = {
     query: { type: 'string', required: true, description: "Search text. Exact tokens, names, and structured-field values work best here (e.g. 'acme-example series A'), since this op does no LLM expansion. This is the search text param — there is no `text` or `q` param." },
     limit: { type: 'number', description: 'Max results (default 20)' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
-    mode: { type: 'string', description: 'Search mode (conservative|balanced|tokenmax). Local callers only.' },
+    mode: { type: 'string', description: 'Search mode (conservative|balanced|tokenmax). Local callers, plus balanced/tokenmax for the fleet router.' },
     // #3985: multi-type filter (plumbing shipped v0.33; exposed here).
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
     // #3800: subagent token economy — per-call snippet cap.
@@ -323,7 +373,7 @@ const search: Operation = {
     // T4/D5 — per-call mode honored ONLY for trusted/local callers so a remote
     // OAuth client can't escalate to the costly tokenmax bundle. Local + unknown
     // mode → loud reject; remote + mode set → silently ignored (uses config).
-    const perCallMode = resolvePerCallMode(ctx, p.mode);
+    const perCallMode = resolveSearchModeForCaller(ctx, p.mode);
 
     // T4/D17 — escape hatch: keyword-only when the operator opts out of the
     // hybrid `search` contract (privacy/cost: no query text to an embedding
@@ -333,7 +383,21 @@ const search: Operation = {
 
     if (keywordOnly) {
       const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, excludePrivate, ...(types ? { types } : {}), ...scope });
-      const results = dedupResults(raw);
+      const deduped = dedupResults(raw);
+      const fallbackReranker = routerKeywordFallback
+        ? await resolvePrecomputedQueryReranker(ctx, perCallMode, limit)
+        : undefined;
+      const results = fallbackReranker
+        ? await applyReranker(queryText, deduped, fallbackReranker)
+        : deduped;
+      const fallbackMeta: HybridSearchMeta | null = fallbackReranker
+        ? {
+          vector_enabled: false,
+          detail_resolved: null,
+          expansion_applied: false,
+          rerank: buildRerankProof(deduped, results, fallbackReranker),
+        }
+        : null;
       // #3783 — every row here IS a keyword hit (direct FTS path); mark
       // before stamping so evidence still reads keyword_exact.
       markKeywordHits(results);
@@ -349,8 +413,8 @@ const search: Operation = {
       await stampUnverifiedExtractions(ctx.engine, results);
       await stampPageUpdatedAt(ctx, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
-      maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
-      ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, null, { conceptHint: true }));
+      maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false, fallbackMeta);
+      ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, fallbackMeta, { conceptHint: true }));
       // #3800: cap AFTER capture/meta so eval + cache see the real payload.
       return applySnippetCap(results, snippetCap);
     }
@@ -358,6 +422,10 @@ const search: Operation = {
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
     // expansion OFF (no per-call LLM cost). `query` op is the full-control variant.
     let capturedMeta: HybridSearchMeta | null = null;
+    let precomputedReranker: SearchOpts['reranker'] | undefined;
+    if (queryEmbedding) {
+      precomputedReranker = await resolvePrecomputedQueryReranker(ctx, perCallMode, limit);
+    }
     const results = await hybridSearchCached(ctx.engine, queryText, {
       limit,
       offset,
@@ -368,7 +436,7 @@ const search: Operation = {
       ...(queryEmbedding ? {
         _queryEmbedding: queryEmbedding,
         useCache: false,
-        reranker: { enabled: false, topNIn: 30, topNOut: null },
+        reranker: precomputedReranker,
       } : {}),
       ...(perCallMode ? { mode: perCallMode } : {}),
       onMeta: (m) => { capturedMeta = m; },

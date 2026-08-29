@@ -39,6 +39,7 @@ import {
 import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker } from './rerank.ts';
+import { buildRerankProof } from './rerank-proof.ts';
 import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery } from './query-intent.ts';
 import { isTitlePhraseMatch } from './title-match.ts';
 import { normalizeAlias } from './alias-normalize.ts';
@@ -2072,10 +2073,7 @@ export async function hybridSearch(
   // reranker sees the full candidate pool (its own topNIn caps how many
   // get sent upstream). Fail-open: any error returns deduped unchanged.
   //
-  // Resolution: per-call SearchOpts.reranker overrides; otherwise pull
-  // from the resolved mode bundle (tokenmax → enabled, others → disabled).
-  // The resolved mode's fields already participate in knobsHash, so cache
-  // rows naturally segregate by reranker config.
+  // Per-call SearchOpts.reranker overrides the resolved mode bundle.
   const rerankerOpts = opts?.reranker ?? {
     enabled: resolvedMode.reranker_enabled,
     topNIn: resolvedMode.reranker_top_n_in,
@@ -2086,6 +2084,7 @@ export async function hybridSearch(
   const reranked = rerankerOpts.enabled
     ? await applyReranker(query, deduped, rerankerOpts as any)
     : deduped;
+  const rerankMeta = buildRerankProof(deduped, reranked, rerankerOpts);
 
   // T3 — free-text alias hop. Runs AFTER rerank so a query that is a page's
   // declared chosen name reliably surfaces that page regardless of how the
@@ -2217,6 +2216,7 @@ export async function hybridSearch(
     ...(vectorPoolUnderfill ? { vector_pool_underfilled: vectorPoolUnderfill } : {}),
     ...(adaptiveDecision ? { adaptive_return: adaptiveDecision } : {}),
     ...(autocutDecision ? { autocut: autocutDecision } : {}),
+    rerank: rerankMeta,
     ...(relationalSlotDecision ? { relational_evidence_slot: relationalSlotDecision } : {}),
   });
   return budgeted;

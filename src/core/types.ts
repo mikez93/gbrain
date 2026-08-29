@@ -1821,7 +1821,6 @@ export interface DegradedStageEntry {
   stage: DegradedStage;
   reason?: DegradedReason;
 }
-
 /**
  * Side-channel metadata that hybridSearch reports about what actually ran.
  * Surfaced via the optional `onMeta` callback in HybridSearchOpts so
@@ -1861,6 +1860,7 @@ export interface HybridSearchMeta {
    * `gbrain search --explain`.
    */
   autocut?: import('./search/autocut.ts').AutocutDecision;
+  rerank?: import('./search/rerank-proof.ts').RerankProof;
   /**
    * #3995 — guaranteed page-1 relational evidence slot. Present only when a
    * fired relational arm's answer had to be promoted from beyond the limit

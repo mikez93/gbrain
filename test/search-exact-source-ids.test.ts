@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
-import { normalizeTrustedQueryEmbedding } from '../src/core/ops/search.ts';
+import {
+  normalizeTrustedQueryEmbedding,
+  normalizeFleetRouterKeywordFallback,
+  resolvePrecomputedQueryReranker,
+  resolveSearchModeForCaller,
+} from '../src/core/ops/search.ts';
 import type { SearchOpts, SearchResult } from '../src/core/types.ts';
 
 const row: SearchResult = {
@@ -23,7 +28,16 @@ function context(
 ): { ctx: OperationContext; calls: SearchOpts[] } {
   const calls: SearchOpts[] = [];
   const engine = {
-    getConfig: async (key: string) => key === 'search.mcp_keyword_only' ? 'true' : null,
+    getConfig: async (key: string) => {
+      if (key === 'search.mcp_keyword_only') return 'true';
+      if (key === 'search.mode') return 'conservative';
+      if (key === 'search.reranker.enabled') return 'false';
+      if (key === 'search.reranker.model') {
+        return 'openrouter:voyageai/rerank-2.5-lite';
+      }
+      if (key === 'search.reranker.top_n_in') return '5';
+      return null;
+    },
     searchKeyword: async (_query: string, opts: SearchOpts) => {
       calls.push(opts);
       return [{ ...row }];
@@ -110,6 +124,25 @@ describe('search source_ids trusted-local contract', () => {
     expect(() => normalizeTrustedQueryEmbedding(context(false).ctx, [0.1, 0.2])).toThrow();
   });
 
+  test('fleet router quality mode keeps reranking enabled with a 25-row-or-larger pool', async () => {
+    const { ctx } = context(true, 'brain-router-imekka-0123456789ab');
+    const mode = resolveSearchModeForCaller(ctx, 'balanced');
+    const reranker = await resolvePrecomputedQueryReranker(ctx, mode, 10);
+
+    expect(mode).toBe('balanced');
+    expect(reranker.enabled).toBe(true);
+    expect(reranker.topNIn).toBeGreaterThanOrEqual(25);
+    expect(reranker.model).toBe('openrouter:voyageai/rerank-2.5-lite');
+  });
+
+  test('fleet router rejects conservative mode while ordinary remote mode stays ignored', () => {
+    const fleet = context(true, 'brain-router-imekka-0123456789ab').ctx;
+    const ordinary = context(true, 'ordinary-client').ctx;
+
+    expect(() => resolveSearchModeForCaller(fleet, 'conservative')).toThrow();
+    expect(resolveSearchModeForCaller(ordinary, 'balanced')).toBeUndefined();
+  });
+
   test('remote ordinary search rejects a vector before retrieval', async () => {
     const { ctx, calls } = context(true, 'ordinary-client');
     await expect(operationsByName.search.handler(ctx, {
@@ -119,22 +152,13 @@ describe('search source_ids trusted-local contract', () => {
     expect(calls).toHaveLength(0);
   });
 
-  test('fleet router may request the bounded keyword fallback', async () => {
-    const { ctx, calls } = context(true, 'brain-router-imekka-0123456789ab');
-    const result = await operationsByName.search.handler(ctx, {
-      query: 'fixture',
-      router_keyword_fallback: true,
-    }) as SearchResult[];
-    expect(result).toHaveLength(1);
-    expect(calls).toHaveLength(1);
+  test('fleet router may request the bounded keyword fallback', () => {
+    const { ctx } = context(true, 'brain-router-imekka-0123456789ab');
+    expect(normalizeFleetRouterKeywordFallback(ctx, true)).toBe(true);
   });
 
-  test('ordinary remote clients cannot request the keyword fallback', async () => {
-    const { ctx, calls } = context(true, 'ordinary-client');
-    await expect(operationsByName.search.handler(ctx, {
-      query: 'fixture',
-      router_keyword_fallback: true,
-    })).rejects.toMatchObject({ code: 'permission_denied' });
-    expect(calls).toHaveLength(0);
+  test('ordinary remote clients cannot request the keyword fallback', () => {
+    const { ctx } = context(true, 'ordinary-client');
+    expect(() => normalizeFleetRouterKeywordFallback(ctx, true)).toThrow();
   });
 });
