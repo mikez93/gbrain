@@ -2,7 +2,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import {
+  MAX_PROPOSALS_PER_PAGE,
   runPhaseProposeTakes,
+  selectStrongestPageProposals,
   type ProposeTakesExtractor,
 } from '../src/core/cycle/propose-takes.ts';
 import { MIGRATIONS } from '../src/core/migrate.ts';
@@ -89,5 +91,64 @@ describe('#2138 per-claim proposal idempotency', () => {
     const result = await runPhaseProposeTakes(context(), { extractor: proposals });
     expect((result.details as Record<string, unknown>).proposals_inserted).toBe(2);
     expect(await countProposals('wiki/essays/thesis')).toBe(2);
+  });
+
+  test('bounds one dense page, retains strongest candidates and reruns idempotently', async () => {
+    await engine.putPage('daily/hermes/long-turn', {
+      title: 'long turn',
+      type: 'analysis' as never,
+      compiled_truth: 'A representative long capture with many candidate judgments.',
+      frontmatter: {},
+      timeline: '',
+    });
+    const dense: ProposeTakesExtractor = async () => Array.from(
+      { length: MAX_PROPOSALS_PER_PAGE + 12 },
+      (_, index) => ({
+        claim_text: `Candidate ${index}`,
+        kind: 'take' as const,
+        holder: 'brain',
+        weight: index / (MAX_PROPOSALS_PER_PAGE + 12),
+      }),
+    );
+
+    const first = await runPhaseProposeTakes(context(), { extractor: dense });
+    expect(first.details.proposals_inserted).toBe(MAX_PROPOSALS_PER_PAGE);
+    expect(first.details.proposals_omitted_by_page_cap).toBe(12);
+    expect(first.details.warnings).toHaveLength(1);
+    const rows = await engine.executeRaw<{
+      source_id: string;
+      page_slug: string;
+      claim_text: string;
+      weight: number;
+    }>(
+      `SELECT source_id, page_slug, claim_text, weight
+         FROM take_proposals
+        WHERE source_id = 'default' AND page_slug = 'daily/hermes/long-turn'
+        ORDER BY id`,
+    );
+    expect(rows).toHaveLength(MAX_PROPOSALS_PER_PAGE);
+    expect(rows.every(row => row.source_id === 'default' && row.page_slug === 'daily/hermes/long-turn')).toBe(true);
+    expect(rows.map(row => row.claim_text)).toEqual(
+      Array.from(
+        { length: MAX_PROPOSALS_PER_PAGE },
+        (_, index) => `Candidate ${MAX_PROPOSALS_PER_PAGE + 11 - index}`,
+      ),
+    );
+
+    const rerun = await runPhaseProposeTakes(context(), { extractor: dense });
+    expect(rerun.details.cache_hits).toBe(1);
+    expect(await countProposals('daily/hermes/long-turn')).toBe(MAX_PROPOSALS_PER_PAGE);
+  });
+
+  test('equal-weight selection is stable in extractor order', () => {
+    const tied = Array.from({ length: MAX_PROPOSALS_PER_PAGE + 2 }, (_, index) => ({
+      claim_text: `Tie ${index}`,
+      kind: 'take' as const,
+      holder: 'brain',
+      weight: 0.5,
+    }));
+    expect(selectStrongestPageProposals(tied).map(row => row.claim_text)).toEqual(
+      tied.slice(0, MAX_PROPOSALS_PER_PAGE).map(row => row.claim_text),
+    );
   });
 });

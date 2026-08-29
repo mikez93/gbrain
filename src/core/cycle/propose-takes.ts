@@ -70,6 +70,15 @@ export const PROPOSE_TAKES_PROMPT_VERSION = 'v0.36.1.0-tuned-cat15';
 export const EMPTY_EXTRACTION_TOMBSTONE_TEXT = '(no gradeable claims)';
 
 /**
+ * One long capture must not monopolize the owner's review queue. Eight keeps
+ * a useful set of claims from a substantive page while forcing a 50-item
+ * review window to represent at least seven source pages instead of, as seen
+ * in Valentina, only two (32 + 18). Existing pending decisions are untouched;
+ * the bound applies only when a new page/content hash is extracted.
+ */
+export const MAX_PROPOSALS_PER_PAGE = 8;
+
+/**
  * Tuned extractor prompt, validated against the hand-labeled synthetic
  * corpus at test/fixtures/calibration/. Measured F1 on first live run
  * via gbrain-evals cat15 (claude-sonnet-4-6 extractor, claude-haiku-4-5
@@ -176,6 +185,8 @@ export interface ProposeTakesResult {
   cache_hits: number;
   cache_misses: number;
   proposals_inserted: number;
+  /** Extracted candidates omitted after deterministic per-page selection. */
+  proposals_omitted_by_page_cap: number;
   /** Idempotency rows written for pages that extracted zero claims. */
   tombstones_written: number;
   budget_exhausted: boolean;
@@ -278,6 +289,26 @@ async function listCandidatePages(
  */
 export function contentHash(pageBody: string): string {
   return createHash('sha256').update(pageBody).digest('hex');
+}
+
+/**
+ * Keep the strongest candidates from one page, deterministically. Extractor
+ * weight is the explicit conviction signal; ties retain extractor order.
+ * Returning a new array keeps injected extractor fixtures immutable.
+ */
+export function selectStrongestPageProposals(
+  proposals: readonly ProposedTake[],
+  limit = MAX_PROPOSALS_PER_PAGE,
+): ProposedTake[] {
+  if (!Number.isSafeInteger(limit) || limit < 1) {
+    throw new Error('proposal page cap must be a positive integer');
+  }
+  if (proposals.length <= limit) return [...proposals];
+  return proposals
+    .map((proposal, index) => ({ proposal, index }))
+    .sort((left, right) => right.proposal.weight - left.proposal.weight || left.index - right.index)
+    .slice(0, limit)
+    .map(({ proposal }) => proposal);
 }
 
 /**
@@ -626,6 +657,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
             cache_hits: 0,
             cache_misses: 0,
             proposals_inserted: 0,
+            proposals_omitted_by_page_cap: 0,
             tombstones_written: 0,
             budget_exhausted: false,
             warnings: [],
@@ -688,6 +720,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
             cache_hits: 0,
             cache_misses: 0,
             proposals_inserted: 0,
+            proposals_omitted_by_page_cap: 0,
             budget_exhausted: false,
             warnings: [],
           },
@@ -720,6 +753,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           cache_hits: 0,
           cache_misses: 0,
           proposals_inserted: 0,
+          proposals_omitted_by_page_cap: 0,
           tombstones_written: 0,
           budget_exhausted: false,
           warnings: [],
@@ -734,6 +768,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       cache_hits: 0,
       cache_misses: 0,
       proposals_inserted: 0,
+      proposals_omitted_by_page_cap: 0,
       tombstones_written: 0,
       budget_exhausted: false,
       llm_calls_succeeded: 0,
@@ -885,11 +920,21 @@ class ProposeTakesPhase extends BaseCyclePhase {
       result.llm_calls_succeeded += 1;
       llmHalt.reset();
 
+      const selectedProposals = selectStrongestPageProposals(proposals);
+      const omitted = proposals.length - selectedProposals.length;
+      if (omitted > 0) {
+        result.proposals_omitted_by_page_cap += omitted;
+        result.warnings.push(
+          `proposal page cap retained ${selectedProposals.length}/${proposals.length} ` +
+          `strongest candidates from ${page.slug}`,
+        );
+      }
+
       // Write proposals to take_proposals. #2138: the idempotency key is
       // per-CLAIM — take_proposals_idempotency_idx folds md5(claim_text) into
       // the per-page tuple (migration v125), so a multi-claim page keeps every
       // claim. RETURNING id prevents a repeated claim from inflating the count.
-      for (const p of proposals) {
+      for (const p of selectedProposals) {
         const inserted = await engine.executeRaw<{ id: number }>(
           `INSERT INTO take_proposals
              (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
@@ -973,7 +1018,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           cost_usd: 0, // tracker isn't exposed at this layer; cost tracked centrally
           summary:
             `Proposed ${result.proposals_inserted} new takes from ${result.pages_scanned} pages ` +
-            `(${result.cache_hits} cached).`,
+            `(${result.cache_hits} cached; ${result.proposals_omitted_by_page_cap} omitted by page cap).`,
         });
       } catch (err) {
         console.error(`[propose_takes] receipt write failed: ${(err as Error).message}`);
@@ -1010,6 +1055,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
     return {
       summary:
         `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals, ${result.tombstones_written} empty (run ${proposalRunId})` +
+        (result.proposals_omitted_by_page_cap > 0
+          ? `; ${result.proposals_omitted_by_page_cap} lower-weight candidate(s) omitted by page cap`
+          : '') +
         (result.aborted_global_error
           ? `; aborted on ${result.aborted_global_error} error after ${result.pages_scanned} page(s)`
           : '') +
@@ -1048,5 +1096,6 @@ export const __testing = {
   contentHash,
   hasCompleteFence,
   extractExistingTakesForDedup,
+  selectStrongestPageProposals,
   listCandidatePages,
 };
