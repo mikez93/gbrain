@@ -2472,16 +2472,71 @@ export async function registerBuiltinHandlers(
   // config re-stamped per job). #4310: wrapped in the provider-halt cooldown
   // (llm-halt-cooldown.ts) — a globally-broken provider defers the queue.
   registerBuiltinJob(worker, engine, 'facts-absorb', withFactsAbsorbHaltCooldown(async (job) => {
-    const slug = typeof job.data.slug === 'string' ? job.data.slug : '';
-    if (!slug) throw new Error('facts-absorb job requires data.slug');
-    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : 'default';
+    const {
+      runFactsBackstop,
+      factsAbsorbReplayLineage,
+      factsAbsorbCandidateMetadata,
+      parseFactsAbsorbVersionedIdentity,
+      validateFactsAbsorbLivePage,
+    } = await import('../core/facts/backstop.ts');
+    const { UnrecoverableError } = await import('../core/minions/types.ts');
+    const versioned = job.data.payload_lineage_version !== undefined
+      || (typeof job.idempotency_key === 'string' && job.idempotency_key.startsWith('facts-absorb:v'));
+    let identity: ReturnType<typeof parseFactsAbsorbVersionedIdentity> | undefined;
+    if (versioned) {
+      try {
+        identity = parseFactsAbsorbVersionedIdentity({
+          data: job.data,
+          queue: job.queue,
+          idempotencyKey: job.idempotency_key,
+        });
+      } catch (error) {
+        throw new UnrecoverableError(error instanceof Error ? error.message : String(error));
+      }
+    }
+    const slug = identity?.slug ?? (typeof job.data.slug === 'string' ? job.data.slug : '');
+    if (!slug) throw new UnrecoverableError('facts-absorb job requires data.slug');
+    const sourceId = identity?.sourceId ?? (typeof job.data.sourceId === 'string' ? job.data.sourceId : 'default');
+    const runtimeMetadata = factsAbsorbCandidateMetadata();
+    if (identity) {
+      for (const key of ['candidate_release_id', 'candidate_commit_sha', 'candidate_package_version'] as const) {
+        const value = job.data[key];
+        if (typeof value !== 'string' || !value.trim() || value.trim() !== value) {
+          throw new UnrecoverableError(`facts-absorb invalid versioned payload: ${key} must be a non-empty normalized string`);
+        }
+      }
+    }
+    const candidateMetadata = {
+      candidate_release_id: typeof job.data.candidate_release_id === 'string' && job.data.candidate_release_id.trim()
+        ? job.data.candidate_release_id.trim()
+        : runtimeMetadata.candidate_release_id,
+      candidate_commit_sha: typeof job.data.candidate_commit_sha === 'string' && job.data.candidate_commit_sha.trim()
+        ? job.data.candidate_commit_sha.trim()
+        : runtimeMetadata.candidate_commit_sha,
+      candidate_package_version: typeof job.data.candidate_package_version === 'string' && job.data.candidate_package_version.trim()
+        ? job.data.candidate_package_version.trim()
+        : runtimeMetadata.candidate_package_version,
+    };
     const page = await engine.getPage(slug, { sourceId });
-    if (!page) return { skipped: 'page_missing', slug, sourceId };
-    const { runFactsBackstop } = await import('../core/facts/backstop.ts');
-    const KNOWN_SOURCES = ['sync:import', 'mcp:put_page', 'mcp:extract_facts', 'file_upload', 'code_import'] as const;
-    const source = (KNOWN_SOURCES as readonly string[]).includes(job.data.source as string)
-      ? (job.data.source as typeof KNOWN_SOURCES[number])
-      : 'mcp:put_page';
+    if (!page) {
+      if (identity) throw new UnrecoverableError('facts-absorb invalid versioned payload: stored page is missing');
+      return { skipped: 'page_missing', slug, sourceId, ...candidateMetadata };
+    }
+    if (identity) {
+      try {
+        validateFactsAbsorbLivePage(identity, page);
+        factsAbsorbReplayLineage(page, job.data);
+      } catch (error) {
+        throw new UnrecoverableError(error instanceof Error ? error.message : String(error));
+      }
+    }
+    const LEGACY_SOURCES = ['sync:import', 'mcp:put_page', 'mcp:extract_facts', 'file_upload', 'code_import', 'hook:compact'] as const;
+    const source = identity?.source ?? ((LEGACY_SOURCES as readonly string[]).includes(job.data.source as string)
+      ? (job.data.source as typeof LEGACY_SOURCES[number])
+      : 'mcp:put_page');
+    const lineage = identity
+      ? { sessionId: identity.sessionId, sourceSlug: identity.sourceSlug }
+      : factsAbsorbReplayLineage(page, job.data);
     const result = await runFactsBackstop(
       {
         slug: page.slug,
@@ -2492,12 +2547,18 @@ export async function registerBuiltinHandlers(
       {
         engine,
         sourceId,
-        sessionId: typeof job.data.sessionId === 'string' ? job.data.sessionId : null,
+        ...lineage,
         source,
         mode: 'inline',
-        notabilityFilter: job.data.notabilityFilter === 'high-only' ? 'high-only' : 'all',
-        visibility: job.data.visibility === 'world' ? 'world' : 'private',
-        ...(typeof job.data.model === 'string' && job.data.model ? { model: job.data.model } : {}),
+        notabilityFilter: identity?.notabilityFilter ?? (job.data.notabilityFilter === 'high-only' ? 'high-only' : 'all'),
+        visibility: identity?.visibility ?? (job.data.visibility === 'world' ? 'world' : 'private'),
+        ...(identity
+          ? {
+            model: identity.model,
+            entityHints: identity.entityHints,
+            ...(identity.validFrom !== null ? { validFrom: new Date(identity.validFrom) } : {}),
+          }
+          : typeof job.data.model === 'string' && job.data.model ? { model: job.data.model } : {}),
       },
     );
     // Execution-time chat_unavailable in a KEYED worker is config drift —
@@ -2518,7 +2579,7 @@ export async function registerBuiltinHandlers(
         throw new FactsExtractionError('chat_unavailable', jobModel);
       }
     }
-    return result;
+    return { ...result, ...candidateMetadata };
   }));
 
   // Autopilot-cycle handler: delegates to runCycle. Shares the exact same

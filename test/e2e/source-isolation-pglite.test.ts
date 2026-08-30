@@ -17,6 +17,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { operationsByName, type OperationContext } from '../../src/core/operations.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
@@ -100,6 +101,23 @@ beforeEach(async () => {
     chunk_source: 'compiled_truth',
     token_count: 11,
   }], { sourceId: 'src-b' });
+  const captureSlug = 'daily/hermes/fleet-owner/0123456789abcdef0123/turn-a';
+  await engine.putPage(captureSlug, {
+    type: 'note',
+    title: 'Fleet capture origin',
+    compiled_truth: 'capture origin',
+    timeline: '',
+    frontmatter: { hermes_session_ref: '0123456789abcdef0123' },
+  }, { sourceId: 'default' });
+  await engine.executeRaw(
+    `INSERT INTO facts
+       (source_id, entity_slug, fact, kind, visibility, notability, source,
+        source_session, context, source_markdown_slug, confidence)
+     VALUES ('default', 'people/alice', 'Alice source-A fixture', 'fact', 'private',
+             'high', 'mcp:put_page', '0123456789abcdef0123', $1, 'people/alice', 1)`,
+    [captureSlug],
+  );
+  await engine.setConfig('search.mcp_keyword_only', 'true');
 });
 
 describe('v0.34.1 source-isolation regression (#861)', () => {
@@ -300,6 +318,69 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
     const rows = result as Array<{ source_id?: string }>;
     for (const r of rows) {
       expect(r.source_id).toBe('default');
+    }
+  });
+
+  test('operator fleet grant reads its allowed source with a binding but denies src-b before retrieval', async () => {
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'fixture',
+        clientId: 'fleet-source-a',
+        clientName: 'arbitrary',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default'],
+        fleetGrant: 'fleet_router',
+        fleetGrantVersion: 1,
+        fleetGrantSetBy: 'operator',
+        fleetGrantSetAt: '2026-08-29T12:00:00.000Z',
+      },
+    } as unknown as OperationContext;
+    const originalSearchKeyword = engine.searchKeyword.bind(engine);
+    const originalExecuteRaw = engine.executeRaw.bind(engine);
+    let retrievalCalls = 0;
+    let bindingSqlCalls = 0;
+    engine.searchKeyword = (async (...args: Parameters<typeof engine.searchKeyword>) => {
+      retrievalCalls += 1;
+      return originalSearchKeyword(...args);
+    }) as typeof engine.searchKeyword;
+    engine.executeRaw = (async (sql: string, params?: unknown[]) => {
+      if (sql.includes('WITH refs(source_id, slug)')) bindingSqlCalls += 1;
+      return originalExecuteRaw(sql, params);
+    }) as typeof engine.executeRaw;
+    try {
+      const allowed = await operationsByName.search.handler(ctx, {
+        query: 'widgets',
+        limit: 5,
+      }) as Array<Record<string, unknown>>;
+      expect(allowed.length).toBeGreaterThan(0);
+      expect(allowed.every((row) => row.source_id === 'default')).toBeTrue();
+      const alice = allowed.find((row) => row.slug === 'people/alice');
+      expect(alice?.fact_bindings).toEqual([{
+        fact_id: expect.any(Number),
+        capture_page_slug: 'daily/hermes/fleet-owner/0123456789abcdef0123/turn-a',
+        hermes_session_ref: '0123456789abcdef0123',
+        matched_via: 'entity_fence',
+      }]);
+      expect(retrievalCalls).toBe(1);
+      expect(bindingSqlCalls).toBe(1);
+
+      await expect(operationsByName.search.handler(ctx, {
+        query: 'gadgets',
+        source_ids: ['src-b'],
+        limit: 5,
+      })).rejects.toMatchObject({ code: 'permission_denied' });
+      expect(retrievalCalls).toBe(1);
+      expect(bindingSqlCalls).toBe(1);
+    } finally {
+      engine.searchKeyword = originalSearchKeyword;
+      engine.executeRaw = originalExecuteRaw as typeof engine.executeRaw;
     }
   });
 });

@@ -246,6 +246,16 @@ export interface AuthInfo {
    * unset or the projection degraded.
    */
   surfaceSetBy?: string;
+  /**
+   * F4b (v143): dedicated persisted authorization for fleet-router reads of
+   * private capture lineage. The three fields are projected only from the
+   * OAuth row; degraded/legacy token paths omit them and therefore fail
+   * closed. `fleet_router` is authorized only with the operator/time proof.
+  */
+  fleetGrant?: 'ordinary_remote' | 'fleet_router';
+  fleetGrantVersion?: 0 | 1;
+  fleetGrantSetBy?: 'operator';
+  fleetGrantSetAt?: string;
 }
 
 export interface OperationContext {

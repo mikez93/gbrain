@@ -27,6 +27,8 @@ export function buildJobContext(
   return {
     id: job.id,
     name: job.name,
+    queue: job.queue,
+    idempotency_key: job.idempotency_key,
     data: job.data,
     attempts_made: job.attempts_made,
     signal,

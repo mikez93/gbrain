@@ -204,6 +204,12 @@ describe('request_tools {tools: [...]} descriptor fetch (D5)', () => {
 describe('request_tools {surface} persist branch', () => {
   test('happy path: persists surface + surface_set_by=self and writes the audit row', async () => {
     await seedClient('cl-persist');
+    await engine.executeRaw(
+      `UPDATE oauth_clients
+          SET fleet_grant = 'fleet_router', fleet_grant_version = 1,
+              fleet_grant_set_by = 'operator', fleet_grant_set_at = now()
+        WHERE client_id = 'cl-persist'`,
+    );
     const res = await dispatchToolCall(engine, 'request_tools', { surface: 'starter' }, {
       ...HTTP, surfaceCeiling: 'full', auth: authFor('cl-persist', ['read']),
     });
@@ -213,10 +219,17 @@ describe('request_tools {surface} persist branch', () => {
     expect(body.note).toContain('tools/list');
 
     const rows = await engine.executeRaw(
-      `SELECT surface, surface_set_by FROM oauth_clients WHERE client_id = $1`, ['cl-persist'],
+      `SELECT surface, surface_set_by, fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at
+         FROM oauth_clients WHERE client_id = $1`, ['cl-persist'],
     );
     expect(rows[0].surface).toBe('starter');
     expect(rows[0].surface_set_by).toBe('self');
+    // request_tools owns only the catalog surface. It cannot create, clear,
+    // retain-by-rewrite, or infer the dedicated fleet authorization.
+    expect(rows[0].fleet_grant).toBe('fleet_router');
+    expect(rows[0].fleet_grant_version).toBe(1);
+    expect(rows[0].fleet_grant_set_by).toBe('operator');
+    expect(rows[0].fleet_grant_set_at).toBeTruthy();
 
     // Amendment 32 / ENG-8: the mutation is answerable from logs alone.
     const audit = await engine.executeRaw(
@@ -229,6 +242,25 @@ describe('request_tools {surface} persist branch', () => {
     expect(params.actor).toBe('cl-persist');
     expect(params.old).toBe(null);
     expect(params.new).toBe('starter');
+  });
+
+  test('ordinary client surface persistence cannot create a fleet grant', async () => {
+    await seedClient('cl-ordinary-persist');
+    const res = await dispatchToolCall(engine, 'request_tools', { surface: 'starter' }, {
+      ...HTTP, surfaceCeiling: 'full', auth: authFor('cl-ordinary-persist', ['read']),
+    });
+    expect(parsed(res).persisted).toBe(true);
+    const [row] = await engine.executeRaw<{
+      fleet_grant: string; fleet_grant_version: number; fleet_grant_set_by: string | null; fleet_grant_set_at: string | null;
+    }>(
+      `SELECT fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at
+         FROM oauth_clients WHERE client_id = $1`,
+      ['cl-ordinary-persist'],
+    );
+    expect(row).toEqual({
+      fleet_grant: 'ordinary_remote', fleet_grant_version: 0,
+      fleet_grant_set_by: null, fleet_grant_set_at: null,
+    });
   });
 
   test('D2 ceiling deny: widening past the ceiling is a machine-readable permission_denied', async () => {

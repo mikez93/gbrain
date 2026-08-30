@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test';
-import { parseAuthCreateArgs, parseAuthClientsArgs, parseRescopeSurfaceValue, renderTokenScopes, listClientRows } from '../src/commands/auth.ts';
+import { parseAuthCreateArgs, parseAuthClientsArgs, parseRescopeSurfaceValue, parseRescopeFleetGrantValue, renderTokenScopes, listClientRows } from '../src/commands/auth.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 describe('parseAuthCreateArgs', () => {
@@ -104,6 +104,16 @@ describe('parseRescopeSurfaceValue (WP4)', () => {
   });
 });
 
+describe('parseRescopeFleetGrantValue (F4b)', () => {
+  test('fleet_router grants, clear revokes, and all other values fail', () => {
+    expect(parseRescopeFleetGrantValue('fleet_router')).toBe('fleet_router');
+    expect(parseRescopeFleetGrantValue('clear')).toBeNull();
+    expect(parseRescopeFleetGrantValue('operator')).toBeUndefined();
+    expect(parseRescopeFleetGrantValue('true')).toBeUndefined();
+    expect(parseRescopeFleetGrantValue('')).toBeUndefined();
+  });
+});
+
 // E4 (WP4): `auth clients [--usage] [--days N] [--json]` flag parsing.
 describe('parseAuthClientsArgs (E4)', () => {
   test('defaults: no usage join, 30d window, human output', () => {
@@ -156,8 +166,11 @@ describe('listClientRows (projection widen)', () => {
       `INSERT INTO sources (id, name) VALUES ('proj-widget', 'proj-widget')`,
     );
     await engine.executeRaw(
-      `INSERT INTO oauth_clients (client_id, client_name, scope, surface, surface_set_by, source_id, federated_read)
-       VALUES ('c-aurora', 'aurora-coder', 'read write', 'starter', 'operator', 'proj-widget', $1)`,
+      `INSERT INTO oauth_clients
+         (client_id, client_name, scope, surface, surface_set_by, source_id, federated_read,
+          fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at)
+       VALUES ('c-aurora', 'aurora-coder', 'read write', 'starter', 'operator', 'proj-widget', $1,
+               'fleet_router', 1, 'operator', '2026-08-29T12:00:00Z')`,
       [['proj-widget', 'default']],
     );
     const rows = await listClientRows(engine);
@@ -169,5 +182,9 @@ describe('listClientRows (projection widen)', () => {
     expect(aurora!.surface_set_by).toBe('operator');
     expect(aurora!.source_id).toBe('proj-widget');
     expect(aurora!.federated_read).toEqual(['proj-widget', 'default']);
+    expect(aurora!.fleet_grant).toBe('fleet_router');
+    expect(aurora!.fleet_grant_version).toBe(1);
+    expect(aurora!.fleet_grant_set_by).toBe('operator');
+    expect(aurora!.fleet_grant_set_at).toBeTruthy();
   });
 });

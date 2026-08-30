@@ -89,6 +89,8 @@ async function makeFakeJob(opts: FakeJobOpts): Promise<{ jobId: number; ctx: Min
   const ctx: MinionJobContext = {
     id: jobId,
     name: 'subagent',
+    queue: 'default',
+    idempotency_key: null,
     data: { prompt: opts.prompt, model: opts.model, allowed_tools: opts.allowed_tools },
     attempts_made: 0,
     signal: abortCtrl.signal,

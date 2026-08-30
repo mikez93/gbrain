@@ -37,6 +37,8 @@ function ctxWithInbox(
   const ctx = {
     id: jobId,
     name: 'subagent_aggregator',
+    queue: 'default',
+    idempotency_key: null,
     data,
     attempts_made: 0,
     signal: new AbortController().signal,

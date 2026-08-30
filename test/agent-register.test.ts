@@ -45,6 +45,7 @@ function baseRegisterArgs(over: Partial<RegisterClientArgs> = {}): RegisterClien
     boundMaxConcurrent: undefined,
     budgetUsdPerDay: undefined,
     tokenTtlSeconds: undefined,
+    fleetRouter: false,
     ...over,
   };
 }

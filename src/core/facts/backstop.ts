@@ -40,6 +40,8 @@
 import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
 import { isFactsBackstopEligible } from './eligibility.ts';
 import type { PageType } from '../types.ts';
+import { createHash } from 'node:crypto';
+import { VERSION } from '../../version.ts';
 
 export interface FactsBackstopCtx {
   engine: BrainEngine;
@@ -109,6 +111,229 @@ interface ParsedPageInput {
   type: PageType;
   compiled_truth: string;
   frontmatter: Record<string, unknown>;
+}
+
+export const FACTS_ABSORB_PAYLOAD_LINEAGE_VERSION = 1 as const;
+export const FACTS_ABSORB_QUEUE = 'default' as const;
+
+export const FACTS_ABSORB_SOURCES = [
+  'sync:import',
+  'mcp:put_page',
+  'mcp:extract_facts',
+  'file_upload',
+  'code_import',
+  'hook:compact',
+] as const satisfies readonly FactsBackstopCtx['source'][];
+
+export interface FactsAbsorbExecutionIdentity {
+  payloadLineageVersion: number;
+  queue: string;
+  sourceId: string;
+  slug: string;
+  pageType: string;
+  contentHash: string;
+  source: FactsBackstopCtx['source'];
+  sourceSlug: string;
+  sessionId: string | null;
+  notabilityFilter: 'all' | 'high-only';
+  visibility: 'private' | 'world';
+  model: string;
+  validFrom: string | null;
+  entityHints: string[];
+}
+
+/**
+ * F4b: one length-safe, fixed-order execution identity. JSON array framing
+ * prevents delimiter collisions; the full content hash and every effective
+ * semantic input participate. Release metadata is intentionally excluded so
+ * deploying the same code does not create duplicate semantic work.
+ */
+export function factsAbsorbExecutionIdentityCanonical(input: FactsAbsorbExecutionIdentity): string {
+  return JSON.stringify([
+    'facts-absorb',
+    input.payloadLineageVersion,
+    input.queue,
+    input.sourceId,
+    input.slug,
+    input.pageType,
+    input.contentHash,
+    input.source,
+    input.sourceSlug,
+    input.sessionId,
+    input.notabilityFilter,
+    input.visibility,
+    input.model,
+    input.validFrom,
+    input.entityHints,
+  ] as const);
+}
+
+export function factsAbsorbExecutionIdentityHash(input: FactsAbsorbExecutionIdentity): string {
+  return createHash('sha256').update(factsAbsorbExecutionIdentityCanonical(input)).digest('hex');
+}
+
+export function factsAbsorbIdempotencyKey(input: FactsAbsorbExecutionIdentity): string {
+  return `facts-absorb:v${input.payloadLineageVersion}:${factsAbsorbExecutionIdentityHash(input)}`;
+}
+
+export function normalizeFactsAbsorbEntityHints(value: readonly string[] | undefined): string[] {
+  if (!value) return [];
+  return value.map((hint) => hint.trim()).filter(Boolean);
+}
+
+function factsAbsorbPayloadError(message: string): Error {
+  return new Error(`facts-absorb invalid versioned payload: ${message}`);
+}
+
+function requireNonEmptyString(data: Record<string, unknown>, key: string): string {
+  const value = data[key];
+  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
+    throw factsAbsorbPayloadError(`${key} must be a non-empty normalized string`);
+  }
+  return value;
+}
+
+/**
+ * Parse a current durable payload without applying any runtime defaults.
+ * Every value returned here is exactly what participated in the submit-time
+ * canonical identity. Historical payloads are intentionally handled by the
+ * bounded unversioned branch in the jobs handler instead.
+ */
+export function parseFactsAbsorbVersionedIdentity(input: {
+  data: Record<string, unknown>;
+  queue: unknown;
+  idempotencyKey: unknown;
+}): FactsAbsorbExecutionIdentity {
+  const { data } = input;
+  if (data.payload_lineage_version !== FACTS_ABSORB_PAYLOAD_LINEAGE_VERSION) {
+    throw factsAbsorbPayloadError(`unsupported payload_lineage_version ${String(data.payload_lineage_version)}`);
+  }
+  if (input.queue !== FACTS_ABSORB_QUEUE || data.queue !== FACTS_ABSORB_QUEUE) {
+    throw factsAbsorbPayloadError(`queue must exactly equal ${FACTS_ABSORB_QUEUE}`);
+  }
+  const source = data.source;
+  if (typeof source !== 'string' || !(FACTS_ABSORB_SOURCES as readonly string[]).includes(source)) {
+    throw factsAbsorbPayloadError('source is missing or not a recognized production provenance value');
+  }
+  const sessionId = data.sessionId;
+  if (sessionId !== null && (typeof sessionId !== 'string' || sessionId.length === 0 || sessionId.trim() !== sessionId)) {
+    throw factsAbsorbPayloadError('sessionId must be null or a non-empty normalized string');
+  }
+  if (data.notabilityFilter !== 'all' && data.notabilityFilter !== 'high-only') {
+    throw factsAbsorbPayloadError('notabilityFilter must be all or high-only');
+  }
+  if (data.visibility !== 'private' && data.visibility !== 'world') {
+    throw factsAbsorbPayloadError('visibility must be private or world');
+  }
+  const contentHash = requireNonEmptyString(data, 'contentHash');
+  if (!/^[0-9a-f]{64}$/.test(contentHash)) {
+    throw factsAbsorbPayloadError('contentHash must be a full lowercase SHA-256');
+  }
+  const validFrom = data.validFrom;
+  if (validFrom !== null && (typeof validFrom !== 'string' || !Number.isFinite(Date.parse(validFrom)))) {
+    throw factsAbsorbPayloadError('validFrom must be null or an ISO-8601 string');
+  }
+  if (!Array.isArray(data.entityHints) || !data.entityHints.every((hint) =>
+    typeof hint === 'string' && hint.length > 0 && hint.trim() === hint)) {
+    throw factsAbsorbPayloadError('entityHints must be an array of non-empty normalized strings');
+  }
+  const identity: FactsAbsorbExecutionIdentity = {
+    payloadLineageVersion: FACTS_ABSORB_PAYLOAD_LINEAGE_VERSION,
+    queue: FACTS_ABSORB_QUEUE,
+    sourceId: requireNonEmptyString(data, 'sourceId'),
+    slug: requireNonEmptyString(data, 'slug'),
+    pageType: requireNonEmptyString(data, 'pageType'),
+    contentHash,
+    source: source as FactsBackstopCtx['source'],
+    sourceSlug: requireNonEmptyString(data, 'sourceSlug'),
+    sessionId: sessionId as string | null,
+    notabilityFilter: data.notabilityFilter,
+    visibility: data.visibility,
+    model: requireNonEmptyString(data, 'model'),
+    validFrom: validFrom as string | null,
+    entityHints: [...data.entityHints] as string[],
+  };
+  const executionHash = factsAbsorbExecutionIdentityHash(identity);
+  if (data.execution_identity_hash !== executionHash) {
+    throw factsAbsorbPayloadError('execution_identity_hash does not match the canonical payload');
+  }
+  const expectedKey = factsAbsorbIdempotencyKey(identity);
+  if (input.idempotencyKey !== expectedKey) {
+    throw factsAbsorbPayloadError('idempotency_key does not match the canonical payload');
+  }
+  return identity;
+}
+
+export function validateFactsAbsorbLivePage(
+  identity: FactsAbsorbExecutionIdentity,
+  page: { slug: string; type: string; compiled_truth: string; frontmatter?: Record<string, unknown> },
+): void {
+  if (page.slug !== identity.slug) {
+    throw factsAbsorbPayloadError('loaded page slug does not match the stored identity');
+  }
+  if (page.type !== identity.pageType) {
+    throw factsAbsorbPayloadError('loaded page type does not match the stored identity');
+  }
+  const liveHash = createHash('sha256').update(page.compiled_truth).digest('hex');
+  if (liveHash !== identity.contentHash) {
+    throw factsAbsorbPayloadError('loaded page content hash does not match the stored identity');
+  }
+}
+
+export function factsAbsorbCandidateMetadata(
+  env: NodeJS.ProcessEnv = process.env,
+): {
+  candidate_release_id: string;
+  candidate_commit_sha: string;
+  candidate_package_version: string;
+} {
+  return {
+    candidate_release_id: env.GBRAIN_ENGINE_VERSION?.trim() || 'unpackaged',
+    candidate_commit_sha: env.GBRAIN_ENGINE_SOURCE_COMMIT?.trim() || 'unpackaged',
+    candidate_package_version: VERSION,
+  };
+}
+
+/** Recover lineage for both current and pre-sourceSlug durable job payloads. */
+export function factsAbsorbReplayLineage(
+  page: { slug: string; frontmatter?: Record<string, unknown> },
+  data: Record<string, unknown>,
+): Pick<FactsBackstopCtx, 'sessionId' | 'sourceSlug'> {
+  // Only payloads with NO version are legacy. A present/unknown version is
+  // never allowed to fall through to inferred lineage.
+  if (data.payload_lineage_version === undefined) {
+    const legacySession = page.frontmatter?.hermes_session_ref;
+    return {
+      sessionId: typeof data.sessionId === 'string' && data.sessionId.trim()
+        ? data.sessionId.trim()
+        : typeof legacySession === 'string' && legacySession.trim()
+          ? legacySession.trim()
+          : null,
+      sourceSlug: typeof data.sourceSlug === 'string' && data.sourceSlug.trim()
+        ? data.sourceSlug.trim()
+        : page.slug,
+    };
+  }
+  if (data.payload_lineage_version !== FACTS_ABSORB_PAYLOAD_LINEAGE_VERSION) {
+    throw new Error(`facts-absorb unsupported payload_lineage_version: ${String(data.payload_lineage_version)}`);
+  }
+  const sourceSlug = typeof data.sourceSlug === 'string' ? data.sourceSlug.trim() : '';
+  const sessionId = typeof data.sessionId === 'string' ? data.sessionId.trim() : '';
+  if (data.source === 'mcp:put_page') {
+    const pageSession = typeof page.frontmatter?.hermes_session_ref === 'string'
+      ? page.frontmatter.hermes_session_ref.trim()
+      : '';
+    if (!sourceSlug || sourceSlug !== page.slug) {
+      throw new Error(`facts-absorb lineage mismatch: sourceSlug must exactly match loaded page slug "${page.slug}"`);
+    }
+    if (!sessionId || !pageSession || sessionId !== pageSession) {
+      throw new Error('facts-absorb lineage mismatch: sessionId must exactly match loaded page hermes_session_ref');
+    }
+  }
+  return {
+    sessionId: sessionId || null,
+    sourceSlug: sourceSlug || page.slug,
+  };
 }
 
 /**
@@ -236,6 +461,21 @@ export async function runFactsBackstop(
   ctx: FactsBackstopCtx,
 ): Promise<FactsBackstopResult> {
   const mode = ctx.mode ?? 'queue';
+  const frontmatterSession = parsedPage.frontmatter.hermes_session_ref;
+  // The capture page and Hermes session are origin provenance. Keep them
+  // separate from source_markdown_slug, which remains the physical entity
+  // fence coordinate used by markdown-first reconciliation.
+  ctx = {
+    ...ctx,
+    sourceSlug: typeof ctx.sourceSlug === 'string' && ctx.sourceSlug.trim()
+      ? ctx.sourceSlug.trim()
+      : parsedPage.slug,
+    sessionId: typeof ctx.sessionId === 'string' && ctx.sessionId.trim()
+      ? ctx.sessionId.trim()
+      : typeof frontmatterSession === 'string' && frontmatterSession.trim()
+        ? frontmatterSession.trim()
+        : null,
+  };
 
   // --- Eligibility + kill-switch gates (run before any LLM cost) ---
   const { isFactsExtractionEnabled } = await import('./extract.ts');
@@ -296,32 +536,60 @@ export async function runFactsBackstop(
     if (isShortLivedCliProcess()) {
       try {
         const { MinionQueue } = await import('../minions/queue.ts');
-        const { createHash } = await import('node:crypto');
         const contentHash = createHash('sha256')
           .update(parsedPage.compiled_truth)
-          .digest('hex')
-          .slice(0, 16);
+          .digest('hex');
         const minions = new MinionQueue(ctx.engine);
         // [ENG-8] Caller-unset visibility resolves the brain default HERE
         // (not in the long-lived worker) so the durable payload carries the
         // visibility that was in force at write time.
         const { resolveDefaultVisibility } = await import('./visibility.ts');
+        const { getFactsExtractionModel } = await import('./extract.ts');
+        const notabilityFilter = ctx.notabilityFilter ?? 'all';
+        const visibility = ctx.visibility ?? (await resolveDefaultVisibility(ctx.engine));
+        const model = (ctx.model ?? (await getFactsExtractionModel(ctx.engine))).trim();
+        const validFrom = ctx.validFrom === undefined ? null : ctx.validFrom.toISOString();
+        const entityHints = normalizeFactsAbsorbEntityHints(ctx.entityHints);
+        const executionIdentity: FactsAbsorbExecutionIdentity = {
+          payloadLineageVersion: FACTS_ABSORB_PAYLOAD_LINEAGE_VERSION,
+          queue: FACTS_ABSORB_QUEUE,
+          sourceId: ctx.sourceId,
+          slug: parsedPage.slug,
+          pageType: parsedPage.type,
+          contentHash,
+          source: ctx.source,
+          sourceSlug: ctx.sourceSlug!,
+          sessionId: ctx.sessionId,
+          notabilityFilter,
+          visibility,
+          model,
+          validFrom,
+          entityHints,
+        };
+        const executionHash = factsAbsorbExecutionIdentityHash(executionIdentity);
         await minions.add(
           'facts-absorb',
           {
+            payload_lineage_version: FACTS_ABSORB_PAYLOAD_LINEAGE_VERSION,
+            queue: FACTS_ABSORB_QUEUE,
             slug: parsedPage.slug,
+            pageType: parsedPage.type,
+            contentHash,
             sourceId: ctx.sourceId,
             source: ctx.source,
             sessionId: ctx.sessionId,
-            notabilityFilter: ctx.notabilityFilter ?? 'all',
-            visibility: ctx.visibility ?? (await resolveDefaultVisibility(ctx.engine)),
-            ...(ctx.model ? { model: ctx.model } : {}),
+            sourceSlug: ctx.sourceSlug,
+            notabilityFilter,
+            visibility,
+            model,
+            validFrom,
+            entityHints,
+            execution_identity_hash: executionHash,
+            ...factsAbsorbCandidateMetadata(),
           },
           {
-            queue: 'default',
-            // Content-hash key: re-submits after edits, dedups rapid
-            // identical writes (idempotent ON CONFLICT returns existing row).
-            idempotency_key: `facts-absorb:${ctx.sourceId}:${parsedPage.slug}:${contentHash}`,
+            queue: FACTS_ABSORB_QUEUE,
+            idempotency_key: factsAbsorbIdempotencyKey(executionIdentity),
             // 5 attempts at a 60s exponential base (not the 3×1s default):
             // execution-time chat_unavailable is config drift the operator
             // fixes on a human timescale — 3 attempts in ~seconds would

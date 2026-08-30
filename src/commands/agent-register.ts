@@ -523,6 +523,7 @@ export async function runAgentRegister(engine: BrainEngine | null, args: string[
       boundMaxConcurrent: undefined,
       budgetUsdPerDay: undefined,
       tokenTtlSeconds: undefined,
+      fleetRouter: false,
     };
 
     let registered!: RegisteredClient;
@@ -738,7 +739,9 @@ async function runReissue(
   // fixed allowlist, never caller input.
   const projection = [
     'client_id', 'client_name', 'grant_types', 'client_secret_hash',
-    ...['source_id', 'federated_read', 'token_ttl', 'deleted_at'].filter(c => columns.has(c)),
+    ...['source_id', 'federated_read', 'token_ttl', 'deleted_at',
+      'fleet_grant', 'fleet_grant_version', 'fleet_grant_set_by', 'fleet_grant_set_at']
+      .filter(c => columns.has(c)),
   ];
   const rows = await engine.executeRaw<Record<string, unknown>>(
     `SELECT ${projection.join(', ')} FROM oauth_clients WHERE client_id = $1`,
@@ -770,6 +773,10 @@ async function runReissue(
     redirectUris: [],
     sourceId: String(row.source_id ?? 'default'),
     federatedRead: Array.isArray(row.federated_read) ? (row.federated_read as string[]) : [String(row.source_id ?? 'default')],
+    fleetGrant: row.fleet_grant === 'fleet_router' ? 'fleet_router' : 'ordinary_remote',
+    fleetGrantVersion: row.fleet_grant_version === 1 ? 1 : 0,
+    ...(row.fleet_grant_set_by === 'operator' ? { fleetGrantSetBy: 'operator' as const } : {}),
+    ...(row.fleet_grant_set_at != null ? { fleetGrantSetAt: String(row.fleet_grant_set_at) } : {}),
     ...(typeof row.token_ttl === 'number' ? { tokenTtl: row.token_ttl } : {}),
     created: { source: false },
   };

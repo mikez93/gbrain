@@ -29,6 +29,15 @@ describe('parseRegisterClientArgs', () => {
     expect(out.boundSlugPrefixes).toBeUndefined();
     expect(out.boundMaxConcurrent).toBeUndefined();
     expect(out.budgetUsdPerDay).toBeUndefined();
+    expect(out.fleetRouter).toBeFalse();
+  });
+
+  test('--fleet-router is an explicit value-less operator flag', () => {
+    expect(parseRegisterClientArgs(['--fleet-router']).fleetRouter).toBeTrue();
+    expect(() => parseRegisterClientArgs(['--fleet-router', '--fleet-router']))
+      .toThrow(/only once/);
+    expect(() => parseRegisterClientArgs(['--fleet-router', 'true']))
+      .toThrow(/Unknown flag/);
   });
 
   test('--grant-types comma-separated → array', () => {

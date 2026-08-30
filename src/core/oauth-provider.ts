@@ -736,15 +736,17 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       oauthRows = await this.sql`
         SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
                c.source_id, c.federated_read, c.bound_slug_prefixes,
-               c.surface, c.surface_set_by
+               c.surface, c.surface_set_by,
+               c.fleet_grant, c.fleet_grant_version, c.fleet_grant_set_by, c.fleet_grant_set_at
         FROM oauth_tokens t
         LEFT JOIN oauth_clients c ON c.client_id = t.client_id
         WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
       `;
     } catch (err) {
       // Degrade ladder for brains that haven't run apply-migrations yet:
-      // surface/surface_set_by (v127) → bound_slug_prefixes (v85) →
-      // federated_read (v61) → source_id (v60) → pre-v0.34 base projection.
+      // fleet_grant* (v143) → surface/surface_set_by (v127) →
+      // bound_slug_prefixes (v85) → federated_read (v61) → source_id (v60)
+      // → pre-v0.34 base projection.
       // Auth must keep working the whole way down.
       //
       // `isUndefinedColumnError(err, name)` canNOT actually tell us WHICH
@@ -757,10 +759,15 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // verification on a pre-v61 brain.)
       // Any of the optional columns may be the missing one, and on the
       // message-fallback path (drivers that don't surface SQLSTATE) the name
-      // is what identifies it — so probe all five at every rung (ENG-9:
+      // is what identifies it — so probe every optional column at every rung.
+      // (ENG-9:
       // surface + surface_set_by ship in one migration and go missing
       // together, so BOTH names are probed).
       const missingOAuthColumn = (e: unknown): boolean =>
+        isUndefinedColumnError(e, 'fleet_grant') ||
+        isUndefinedColumnError(e, 'fleet_grant_version') ||
+        isUndefinedColumnError(e, 'fleet_grant_set_by') ||
+        isUndefinedColumnError(e, 'fleet_grant_set_at') ||
         isUndefinedColumnError(e, 'surface') ||
         isUndefinedColumnError(e, 'surface_set_by') ||
         isUndefinedColumnError(e, 'bound_slug_prefixes') ||
@@ -768,48 +775,60 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         isUndefinedColumnError(e, 'source_id');
       if (!missingOAuthColumn(err)) throw err;
       try {
-        // v127 missing: drop the surface columns first, keep the fence
-        // column (WP4 amendment 17 — the NEW top rung). Surface degrade is
-        // fail-OPEN by design: the serve-http ceiling still bounds every
-        // request, so a missing per-client surface only means "server
-        // surface applies", never a widened catalog.
+        // v143 missing: retain the complete pre-v143 projection. The fleet
+        // grant is omitted below, so the private-lineage path fails closed
+        // while all pre-existing authorization and surface behavior remains.
         oauthRows = await this.sql`
           SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
-                 c.source_id, c.federated_read, c.bound_slug_prefixes
+                 c.source_id, c.federated_read, c.bound_slug_prefixes,
+                 c.surface, c.surface_set_by
           FROM oauth_tokens t
           LEFT JOIN oauth_clients c ON c.client_id = t.client_id
           WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
         `;
-      } catch (errS) {
-        if (!missingOAuthColumn(errS)) throw errS;
+      } catch (errG) {
+        if (!missingOAuthColumn(errG)) throw errG;
         try {
-          // v85 missing: keep source_id + federated_read, drop the fence column.
+          // v127 missing: drop the surface columns, keep the fence column.
+          // Surface degradation keeps its historical server-ceiling behavior.
           oauthRows = await this.sql`
             SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
-                   c.source_id, c.federated_read
+                   c.source_id, c.federated_read, c.bound_slug_prefixes
             FROM oauth_tokens t
             LEFT JOIN oauth_clients c ON c.client_id = t.client_id
             WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
           `;
-        } catch (err2) {
-          if (!missingOAuthColumn(err2)) throw err2;
+        } catch (errS) {
+          if (!missingOAuthColumn(errS)) throw errS;
           try {
-            // v61 missing: source_id only.
+            // v85 missing: keep source_id + federated_read, drop the fence.
             oauthRows = await this.sql`
-              SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name, c.source_id
+              SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
+                     c.source_id, c.federated_read
               FROM oauth_tokens t
               LEFT JOIN oauth_clients c ON c.client_id = t.client_id
               WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
             `;
-          } catch (err3) {
-            if (!missingOAuthColumn(err3)) throw err3;
-            // Truly pre-v60: pre-v0.34 projection.
-            oauthRows = await this.sql`
-              SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
-              FROM oauth_tokens t
-              LEFT JOIN oauth_clients c ON c.client_id = t.client_id
-              WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
-            `;
+          } catch (err2) {
+            if (!missingOAuthColumn(err2)) throw err2;
+            try {
+              // v61 missing: source_id only.
+              oauthRows = await this.sql`
+                SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name, c.source_id
+                FROM oauth_tokens t
+                LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+                WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
+              `;
+            } catch (err3) {
+              if (!missingOAuthColumn(err3)) throw err3;
+              // Truly pre-v60: pre-v0.34 projection.
+              oauthRows = await this.sql`
+                SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
+                FROM oauth_tokens t
+                LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+                WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
+              `;
+            }
           }
         }
       }
@@ -871,6 +890,27 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // fail-open by design: the server ceiling still bounds every request.
       const rowSurface = typeof row.surface === 'string' ? row.surface : undefined;
       const rowSurfaceSetBy = typeof row.surface_set_by === 'string' ? row.surface_set_by : undefined;
+      // F4b (v143): dedicated fleet grant. Only the two enumerated states,
+      // the literal operator marker, and a parseable persisted timestamp are
+      // projected. Missing columns, malformed restored rows, and legacy
+      // bearer tokens therefore cannot manufacture authorization.
+      const rowFleetGrant = row.fleet_grant === 'ordinary_remote' || row.fleet_grant === 'fleet_router'
+        ? row.fleet_grant
+        : undefined;
+      const rowFleetGrantVersion = row.fleet_grant_version === 0 || row.fleet_grant_version === 1
+        ? row.fleet_grant_version as 0 | 1
+        : undefined;
+      const rowFleetGrantSetBy = row.fleet_grant_set_by === 'operator'
+        ? 'operator' as const
+        : undefined;
+      const fleetGrantDate = row.fleet_grant_set_at == null
+        ? undefined
+        : row.fleet_grant_set_at instanceof Date
+          ? row.fleet_grant_set_at
+          : new Date(String(row.fleet_grant_set_at));
+      const rowFleetGrantSetAt = fleetGrantDate && Number.isFinite(fleetGrantDate.getTime())
+        ? fleetGrantDate.toISOString()
+        : undefined;
       return {
         token,
         clientId: row.client_id as string,
@@ -893,6 +933,10 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // WP4: per-client surface + operator-lock marker (amendment 19).
         ...(rowSurface !== undefined ? { surface: rowSurface } : {}),
         ...(rowSurfaceSetBy !== undefined ? { surfaceSetBy: rowSurfaceSetBy } : {}),
+        ...(rowFleetGrant !== undefined ? { fleetGrant: rowFleetGrant } : {}),
+        ...(rowFleetGrantVersion !== undefined ? { fleetGrantVersion: rowFleetGrantVersion } : {}),
+        ...(rowFleetGrantSetBy !== undefined ? { fleetGrantSetBy: rowFleetGrantSetBy } : {}),
+        ...(rowFleetGrantSetAt !== undefined ? { fleetGrantSetAt: rowFleetGrantSetAt } : {}),
       } as CoreAuthInfo as SdkAuthInfo;
     }
 
@@ -1279,11 +1323,20 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
        * (the operator lock: request_tools persist cannot override it).
        */
       surface?: 'verbs' | 'starter' | 'full' | null;
+      /**
+       * F4b (v143): operator-only fleet-router authorization. Undefined
+       * leaves it untouched; 'fleet_router' grants; null clears back to the
+       * ordinary_remote state. Every mutation records proof columns and an
+       * audit row in the same SQL statement.
+       */
+      fleetGrant?: 'fleet_router' | null;
+      fleetGrantActor?: 'operator' | 'admin-api';
+      fleetGrantVia?: 'register_cli' | 'rescope_cli' | 'admin_api';
     },
-  ): Promise<{ clientId: string; clientName: string; sourceId: string; federatedRead: string[]; boundSlugPrefixes?: string[] | null; surface?: string | null; surfaceOld?: string | null }> {
-    const { sourceId, federatedRead, boundSlugPrefixes, surface } = opts;
-    if (sourceId === undefined && federatedRead === undefined && boundSlugPrefixes === undefined && surface === undefined) {
-      throw new Error('rescope-client requires --source, --federated-read, --bound-slug-prefixes, and/or --surface');
+  ): Promise<{ clientId: string; clientName: string; sourceId: string; federatedRead: string[]; boundSlugPrefixes?: string[] | null; surface?: string | null; surfaceOld?: string | null; fleetGrant?: 'ordinary_remote' | 'fleet_router'; fleetGrantOld?: 'ordinary_remote' | 'fleet_router'; fleetGrantVersion?: 1; fleetGrantSetBy?: 'operator'; fleetGrantSetAt?: string; fleetGrantEventId?: number }> {
+    const { sourceId, federatedRead, boundSlugPrefixes, surface, fleetGrant } = opts;
+    if (sourceId === undefined && federatedRead === undefined && boundSlugPrefixes === undefined && surface === undefined && fleetGrant === undefined) {
+      throw new Error('rescope-client requires --source, --federated-read, --bound-slug-prefixes, --surface, and/or --fleet-grant');
     }
     if (sourceId !== undefined) assertValidSourceId(sourceId);
     if (federatedRead !== undefined) {
@@ -1298,6 +1351,9 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     if (surface !== undefined && surface !== null
         && surface !== 'verbs' && surface !== 'starter' && surface !== 'full') {
       throw new Error(`--surface must be verbs | starter | full | clear (got "${String(surface)}")`);
+    }
+    if (fleetGrant !== undefined && fleetGrant !== null && fleetGrant !== 'fleet_router') {
+      throw new Error(`--fleet-grant must be fleet_router | clear (got "${String(fleetGrant)}")`);
     }
     // v0.42.72.0: bound_slug_prefixes rescope, so channel-membership churn
     // (the qm-harness roster case) updates the write fence in place instead
@@ -1323,13 +1379,71 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         `;
         surfaceOld = prior.length > 0 ? ((prior[0].surface as string | null) ?? null) : null;
       }
+      // v143 grant mutations name the complete current OAuth shape and write
+      // the grant audit atomically. A caller cannot receive a successful
+      // grant without the matching audit row. Older non-grant rescope calls
+      // retain the compatibility branches below.
+      const surfaceSetBy = surface === null ? null : 'operator';
+      if (fleetGrant !== undefined) {
+        const newFleetGrant = fleetGrant === null ? 'ordinary_remote' : fleetGrant;
+        const auditActor = opts.fleetGrantActor ?? 'operator';
+        const auditVia = opts.fleetGrantVia ?? (auditActor === 'admin-api' ? 'admin_api' : 'rescope_cli');
+        rows = await this.sql`
+          WITH prior AS MATERIALIZED (
+            SELECT client_id, fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at
+              FROM oauth_clients
+             WHERE client_id = ${clientId}
+             FOR UPDATE
+          ), updated AS (
+            UPDATE oauth_clients AS c
+               SET source_id = CASE WHEN ${sourceId !== undefined}::boolean
+                                    THEN ${sourceId ?? null}::text ELSE c.source_id END,
+                   federated_read = CASE WHEN ${federatedRead !== undefined}::boolean
+                                         THEN ${federatedRead ? pgArray(federatedRead) : null}::text[] ELSE c.federated_read END,
+                   bound_slug_prefixes = CASE WHEN ${boundSlugPrefixes !== undefined}::boolean
+                                              THEN ${boundSlugPrefixes ? pgArray(boundSlugPrefixes) : null}::text[] ELSE c.bound_slug_prefixes END,
+                   surface = CASE WHEN ${surface !== undefined}::boolean
+                                  THEN ${surface ?? null}::text ELSE c.surface END,
+                   surface_set_by = CASE WHEN ${surface !== undefined}::boolean
+                                         THEN ${surfaceSetBy}::text ELSE c.surface_set_by END,
+                   fleet_grant = ${newFleetGrant}::text,
+                   fleet_grant_version = 1,
+                   fleet_grant_set_by = 'operator',
+                   fleet_grant_set_at = now()
+              FROM prior AS p
+             WHERE c.client_id = p.client_id
+             RETURNING c.client_id, c.client_name, c.source_id, c.federated_read,
+                       c.bound_slug_prefixes, c.surface, c.surface_set_by,
+                       c.fleet_grant, c.fleet_grant_version, c.fleet_grant_set_by, c.fleet_grant_set_at
+          ), audited AS (
+            INSERT INTO mcp_request_log
+              (token_name, agent_name, operation, latency_ms, status, params)
+            SELECT ${auditActor}, ${auditActor}, 'fleet_grant_change', 0, 'success',
+                   jsonb_build_object(
+                     'actor', ${auditActor}::text,
+                     'client_id', u.client_id,
+                     'old', p.fleet_grant,
+                     'old_version', p.fleet_grant_version,
+                     'old_set_by', p.fleet_grant_set_by,
+                     'old_set_at', p.fleet_grant_set_at,
+                     'new', u.fleet_grant,
+                     'new_version', u.fleet_grant_version,
+                     'new_set_by', u.fleet_grant_set_by,
+                     'new_set_at', u.fleet_grant_set_at,
+                     'via', ${auditVia}::text
+                   )
+              FROM updated AS u CROSS JOIN prior AS p
+             RETURNING id
+          )
+          SELECT u.*, p.fleet_grant AS fleet_grant_old, a.id AS fleet_grant_event_id
+            FROM updated AS u CROSS JOIN prior AS p CROSS JOIN audited AS a
+        `;
       // Only touch bound_slug_prefixes / surface when the caller actually
       // passed them. Naming a column unconditionally would make a plain
       // `rescope-client --source wiki` fail on a brain that has the v60/v61
       // OAuth columns but not v85's bound_* set (or v127's surface set) — a
       // regression on an axis the caller never asked about.
-      const surfaceSetBy = surface === null ? null : 'operator';
-      if (boundSlugPrefixes === undefined && surface === undefined) {
+      } else if (boundSlugPrefixes === undefined && surface === undefined) {
         rows = await this.sql`
             UPDATE oauth_clients
                SET source_id = COALESCE(${sourceId ?? null}::text, source_id),
@@ -1374,7 +1488,11 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         isUndefinedColumnError(err, 'federated_read') ||
         isUndefinedColumnError(err, 'bound_slug_prefixes') ||
         isUndefinedColumnError(err, 'surface') ||
-        isUndefinedColumnError(err, 'surface_set_by')
+        isUndefinedColumnError(err, 'surface_set_by') ||
+        isUndefinedColumnError(err, 'fleet_grant') ||
+        isUndefinedColumnError(err, 'fleet_grant_version') ||
+        isUndefinedColumnError(err, 'fleet_grant_set_by') ||
+        isUndefinedColumnError(err, 'fleet_grant_set_at')
       ) {
         throw new Error('rescope-client requires an up-to-date OAuth schema; run `gbrain apply-migrations --yes` and retry.');
       }
@@ -1402,6 +1520,18 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // WP4: undefined = surface untouched this call; null = cleared.
       ...(surface !== undefined
         ? { surface: (row.surface as string | null) ?? null, surfaceOld: surfaceOld ?? null }
+        : {}),
+      ...(fleetGrant !== undefined
+        ? {
+          fleetGrant: row.fleet_grant as 'ordinary_remote' | 'fleet_router',
+          fleetGrantOld: row.fleet_grant_old as 'ordinary_remote' | 'fleet_router',
+          fleetGrantVersion: 1,
+          fleetGrantSetBy: row.fleet_grant_set_by as 'operator',
+          fleetGrantSetAt: row.fleet_grant_set_at instanceof Date
+            ? row.fleet_grant_set_at.toISOString()
+            : new Date(String(row.fleet_grant_set_at)).toISOString(),
+          fleetGrantEventId: Number(row.fleet_grant_event_id),
+        }
         : {}),
     };
   }

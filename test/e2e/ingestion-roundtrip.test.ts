@@ -46,6 +46,8 @@ function makeFakeJobCtx(data: Record<string, unknown>): MinionJobContext {
   return {
     id: Math.floor(Math.random() * 1_000_000),
     name: 'ingest_capture',
+    queue: 'default',
+    idempotency_key: null,
     data,
     attempts_made: 1,
     signal: new AbortController().signal,

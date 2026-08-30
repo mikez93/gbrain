@@ -6231,6 +6231,69 @@ export const MIGRATIONS: Migration[] = [
       return Number(rows[0]?.n ?? 0) === 4;
     },
   },
+  {
+    version: 143,
+    name: 'oauth_fleet_router_grant',
+    // F4b: private capture-lineage visibility is authorized by a dedicated,
+    // operator-written OAuth-row grant. Existing and DCR clients remain
+    // ordinary_remote. The set_by/time proof travels with every operator
+    // mutation; the provider also writes a fleet_grant_change audit row.
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS fleet_grant TEXT NOT NULL DEFAULT 'ordinary_remote';
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS fleet_grant_version INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS fleet_grant_set_by TEXT NULL;
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS fleet_grant_set_at TIMESTAMPTZ NULL;
+
+      ALTER TABLE oauth_clients
+        DROP CONSTRAINT IF EXISTS oauth_clients_fleet_grant_state_chk;
+      ALTER TABLE oauth_clients
+        ADD CONSTRAINT oauth_clients_fleet_grant_state_chk
+        CHECK (fleet_grant IN ('ordinary_remote', 'fleet_router'));
+
+      ALTER TABLE oauth_clients
+        DROP CONSTRAINT IF EXISTS oauth_clients_fleet_grant_version_chk;
+      ALTER TABLE oauth_clients
+        ADD CONSTRAINT oauth_clients_fleet_grant_version_chk
+        CHECK (fleet_grant_version IN (0, 1));
+
+      ALTER TABLE oauth_clients
+        DROP CONSTRAINT IF EXISTS oauth_clients_fleet_grant_proof_chk;
+      ALTER TABLE oauth_clients
+        ADD CONSTRAINT oauth_clients_fleet_grant_proof_chk
+        CHECK (
+          (fleet_grant_version = 0 AND fleet_grant = 'ordinary_remote'
+            AND fleet_grant_set_by IS NULL AND fleet_grant_set_at IS NULL)
+          OR (fleet_grant_version = 1
+            AND fleet_grant_set_by = 'operator' AND fleet_grant_set_at IS NOT NULL)
+        );
+
+      ALTER TABLE oauth_clients
+        DROP CONSTRAINT IF EXISTS oauth_clients_fleet_grant_active_chk;
+      ALTER TABLE oauth_clients
+        ADD CONSTRAINT oauth_clients_fleet_grant_active_chk
+        CHECK (
+          fleet_grant <> 'fleet_router'
+          OR (fleet_grant_version = 1
+            AND fleet_grant_set_by = 'operator' AND fleet_grant_set_at IS NOT NULL)
+        );
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ n: number }>(
+        `SELECT COUNT(*)::int AS n
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'oauth_clients'
+            AND column_name = ANY($1::text[])`,
+        [['fleet_grant', 'fleet_grant_version', 'fleet_grant_set_by', 'fleet_grant_set_at']],
+      );
+      return Number(rows[0]?.n ?? 0) === 4;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

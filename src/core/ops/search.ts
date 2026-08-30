@@ -26,10 +26,12 @@ import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { stampPageDispositions } from '../disposition/search.ts';
+import { stampFactPageBindings } from '../facts/page-bindings.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
 import { resolveDispositionScope } from './dispositions.ts';
+import { canReadFactBindings, isFleetRouterContext } from './fleet-router-context.ts';
 import {
   federatedSearchScope,
   resolvePerCallMode,
@@ -154,16 +156,6 @@ const SOURCE_IDS_PARAM_DESCRIPTION =
 
 const MAX_QUERY_EMBEDDING_DIMENSIONS = 16_384;
 const MIN_FLEET_ROUTER_CANDIDATE_POOL = 25;
-const FLEET_ROUTER_CLIENT_NAME =
-  /^brain-router-[a-z][a-z0-9_-]{0,63}-[0-9a-f]{12}$/;
-
-function isFleetRouterContext(ctx: OperationContext): boolean {
-  return ctx.remote === true
-    && typeof ctx.auth?.clientName === 'string'
-    && FLEET_ROUTER_CLIENT_NAME.test(ctx.auth.clientName)
-    && ctx.auth.scopes.includes('read');
-}
-
 /**
  * Accept a precomputed query vector only from trusted local calls or the
  * operator-provisioned, read-only fleet-router OAuth clients. Remote source
@@ -417,6 +409,7 @@ const search: Operation = {
       await stampUnverifiedExtractions(ctx.engine, results);
       await stampPageDispositions(ctx.engine, results);
       await stampPageUpdatedAt(ctx, results);
+      await stampFactPageBindings(ctx.engine, results, { authorized: canReadFactBindings(ctx) });
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false, fallbackMeta);
       ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, fallbackMeta, { conceptHint: true }));
@@ -449,6 +442,7 @@ const search: Operation = {
     });
     stampDeepResearchIds(results);
     await stampPageUpdatedAt(ctx, results);
+    await stampFactPageBindings(ctx.engine, results, { authorized: canReadFactBindings(ctx) });
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
@@ -621,6 +615,7 @@ const query: Operation = {
         ...querySourceScope,
       });
       await stampPageDispositions(ctx.engine, results);
+      await stampFactPageBindings(ctx.engine, results, { authorized: canReadFactBindings(ctx) });
       return applySnippetCap(results, snippetCap);
     }
 
@@ -792,6 +787,7 @@ const query: Operation = {
       }
     }
     await stampPageUpdatedAt(ctx, results);
+    await stampFactPageBindings(ctx.engine, results, { authorized: canReadFactBindings(ctx) });
     const latency_ms = Date.now() - startedAt;
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
