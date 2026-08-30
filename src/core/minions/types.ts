@@ -83,6 +83,11 @@ export interface MinionJob {
   /** Renewable private-queue lease. Startup recovery may cancel only after this expires. */
   private_queue_lease_until: Date | null;
 
+  // Budget ownership (migration v93)
+  budget_remaining_cents: number | null;
+  budget_owner_job_id: number | null;
+  budget_root_owner_id: number | null;
+
   // v12: scheduler polish — quiet-hours gate + deterministic stagger
   quiet_hours: Record<string, unknown> | null;
   stagger_key: string | null;
@@ -439,6 +444,83 @@ export class UnrecoverableError extends Error {
 
 // --- Row Mapping ---
 
+/**
+ * Exact live `minion_jobs` column contract used by the one-job execution lane.
+ * Keep this tuple in the acceptance-packet field order. Live schema equality
+ * is name-based because physical ordinals legitimately differ by deployment.
+ */
+export const EXACT_TARGET_JOB_FIELDS = [
+  'id',
+  'name',
+  'queue',
+  'status',
+  'priority',
+  'data',
+  'max_attempts',
+  'attempts_made',
+  'attempts_started',
+  'backoff_type',
+  'backoff_delay',
+  'backoff_jitter',
+  'stalled_counter',
+  'max_stalled',
+  'lock_token',
+  'lock_until',
+  'delay_until',
+  'parent_job_id',
+  'on_child_fail',
+  'tokens_input',
+  'tokens_output',
+  'tokens_cache_read',
+  'depth',
+  'max_children',
+  'timeout_ms',
+  'lock_duration_ms',
+  'timeout_at',
+  'remove_on_complete',
+  'remove_on_fail',
+  'idempotency_key',
+  'private_queue_owner_job_id',
+  'private_queue_owner_token',
+  'private_queue_lease_until',
+  'budget_remaining_cents',
+  'budget_owner_job_id',
+  'budget_root_owner_id',
+  'quiet_hours',
+  'stagger_key',
+  'result',
+  'progress',
+  'error_text',
+  'stacktrace',
+  'created_at',
+  'started_at',
+  'finished_at',
+  'updated_at',
+] as const satisfies readonly (keyof MinionJob)[];
+
+export type ExactTargetJobField = (typeof EXACT_TARGET_JOB_FIELDS)[number];
+export type ExactTargetFrozenRow = Pick<MinionJob, ExactTargetJobField>;
+
+/**
+ * Map only a byte-for-byte 46-column row. General queue readers remain
+ * forward-compatible through `rowToMinionJob`; exact execution fails closed.
+ */
+export function rowToExactTargetFrozenRow(
+  row: Record<string, unknown>,
+): ExactTargetFrozenRow {
+  const actual = Object.keys(row);
+  const expected = new Set<string>(EXACT_TARGET_JOB_FIELDS);
+  if (actual.length !== expected.size || actual.some((field) => !expected.has(field))) {
+    throw new Error(
+      `exact target row field set mismatch (expected ${expected.size}, received ${actual.length})`,
+    );
+  }
+  const mapped = rowToMinionJob(row);
+  return Object.fromEntries(
+    EXACT_TARGET_JOB_FIELDS.map((field) => [field, mapped[field]]),
+  ) as ExactTargetFrozenRow;
+}
+
 export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
   return {
     id: row.id as number,
@@ -474,6 +556,9 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     private_queue_owner_job_id: (row.private_queue_owner_job_id as number | null) ?? null,
     private_queue_owner_token: (row.private_queue_owner_token as string) || null,
     private_queue_lease_until: row.private_queue_lease_until ? new Date(row.private_queue_lease_until as string) : null,
+    budget_remaining_cents: (row.budget_remaining_cents as number | null) ?? null,
+    budget_owner_job_id: (row.budget_owner_job_id as number | null) ?? null,
+    budget_root_owner_id: (row.budget_root_owner_id as number | null) ?? null,
     quiet_hours: row.quiet_hours ? (typeof row.quiet_hours === 'string' ? JSON.parse(row.quiet_hours) : row.quiet_hours) as Record<string, unknown> : null,
     stagger_key: (row.stagger_key as string) || null,
     result: row.result ? (typeof row.result === 'string' ? JSON.parse(row.result) : row.result) as Record<string, unknown> : null,

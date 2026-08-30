@@ -12,6 +12,7 @@ import type { BrainEngine } from '../engine.ts';
 import type {
   MinionJob, MinionJobInput, MinionJobStatus, InboxMessage, TokenUpdate,
   MinionQueueOpts, ChildDoneMessage, ChildOutcome, Attachment, AttachmentInput,
+  ExactTargetFrozenRow,
 } from './types.ts';
 import { rowToMinionJob, rowToInboxMessage, rowToAttachment } from './types.ts';
 import { validateAttachment } from './attachments.ts';
@@ -36,6 +37,13 @@ import {
   logBatchRetry as auditLogBatchRetry,
   logBatchExhausted as auditLogBatchExhausted,
 } from '../audit/batch-retry-audit.ts';
+import {
+  claimExactTarget,
+  type ExactClaimLatch,
+  type ExactTargetClaimResult,
+} from './exact-target-claim.ts';
+
+export { ExactClaimAmbiguousError, ExactClaimLatch } from './exact-target-claim.ts';
 
 /** Options for opting into protected-job-name submission. Passed as a separate
  *  4th arg to `MinionQueue.add()` (NOT folded into `opts`) so user-spread
@@ -189,17 +197,28 @@ export class MinionQueue {
     }
   }
 
+  async claimExact(
+    expected: ExactTargetFrozenRow,
+    lockToken: string,
+    lockDurationMs: number,
+    latch: ExactClaimLatch,
+    opts?: { signal?: AbortSignal },
+  ): Promise<ExactTargetClaimResult> {
+    return claimExactTarget(
+      this.engine,
+      expected,
+      lockToken,
+      lockDurationMs,
+      latch,
+      opts,
+    );
+  }
+
   /**
    * Submit a new job.
    *
-   * Wrapped in engine.transaction(): when parent_job_id is set, takes
-   * SELECT ... FOR UPDATE on the parent so concurrent submissions serialize
-   * on the cap check. Without this, two concurrent submissions could both
-   * see count = N-1 and both insert, blowing max_children.
-   *
-   * Child status is 'waiting' (or 'delayed') — claimable. Parent is flipped
-   * to 'waiting-children' atomically. Idempotency_key dedups via PG unique
-   * partial index; same key returns the existing row (no second insert).
+   * Parent submissions serialize the child-cap check in a transaction.
+   * Idempotency keys return the existing row instead of inserting twice.
    */
   async add(
     name: string,
@@ -1411,36 +1430,17 @@ export class MinionQueue {
    * Sets timeout_at = now() + timeout_ms when the job has a per-job deadline,
    * so handleTimeouts() can dead-letter expired jobs without rereading timeout_ms.
    *
-   * Claim-time budget fallback: rows inserted before the submit-time stamping
-   * (or by any writer that bypasses add()) carry timeout_ms = NULL and used to
-   * fall through to the minutes-scale null-default wall-clock sweep — a 30-min
-   * handler died at ~5 min purely because of WHEN its row was inserted. The
-   * COALESCE below resolves HANDLER_DEFAULT_TIMEOUT_MS at claim as the durable
-   * invariant (the v128 migration is the one-shot repair for rows already in
-   * flight). Names outside the map stay NULL — exactly today's behavior.
-   * Postgres evaluates SET expressions against the OLD row, so the timeout_at
-   * CASE must repeat the COALESCE rather than reference the assigned column.
-   * The map binds as a RAW object (never JSON.stringify into ::jsonb — the
-   * postgres.js double-encode trap; PGLite hides it, real PG does not).
+   * Rows bypassing add() may have no timeout. Claim resolves the handler map
+   * as the durable fallback; names outside it stay NULL. Postgres evaluates
+   * SET expressions against the old row, so timeout_at repeats the COALESCE.
+   * Handler maps bind as raw objects, never JSON.stringify into ::jsonb.
    */
   async claim(lockToken: string, lockDurationMs: number, queue: string, registeredNames: string[]): Promise<MinionJob | null> {
     if (registeredNames.length === 0) return null;
 
-    // Direct (session-mode) pool: claim opens the lock that renewLock then
-    // heartbeats. Both must live on a connection the transaction-mode pooler
-    // won't recycle mid-hold, or the lock orphans and the worker wedges.
-    //
-    // #4145: lock_duration_ms resolves row → handler map ($6, RAW object —
-    // same double-encode rule as $5) → worker default ($2), is STAMPED onto
-    // the row (durable, like timeout_ms), and lock_until derives from the
-    // same COALESCE (OLD-row semantics: repeat the expression, don't
-    // reference the assigned column). Both the stamp and lock_until are
-    // CASE-clamped to the [5s,1h] bound IN SQL (row/map resolution only —
-    // the worker-default fallback $2 is operator-configured, not row data,
-    // and tests/short-lived workers legitimately use sub-5s leases): the exposed
-    // submit surfaces clamp already, but a bypass-written row (direct SQL
-    // repair, foreign tooling) must not grant a ~24-day lease to a worker
-    // that crashes before its first renewal (or a 1ms one that thrashes).
+    // The direct session pool keeps claim/renewal off transaction-pooler
+    // recycling. Row/handler lock leases are SQL-clamped to [5s,1h]; the
+    // operator worker fallback remains intentionally unclamped for tests.
     const rows = await this.engine.executeRawDirect<Record<string, unknown>>(
       `UPDATE minion_jobs SET
         status = 'active',
