@@ -115,7 +115,7 @@ export function parseMigrateEmbeddingsFlags(args: string[]): MigrateEmbeddingsFl
   };
 }
 
-function printHelp(): void {
+export function printMigrateEmbeddingsHelp(): void {
   process.stdout.write(`Usage: gbrain migrate embeddings --to <provider:model> [flags]
 
 Re-embed the whole brain onto a different embedding provider/model. Handles
@@ -792,7 +792,7 @@ export async function runMigrateEmbeddings(
   // exit() call as terminal (required for narrowing after the guard blocks).
   const exit: (code: number) => never = opts.exit ?? ((code: number) => process.exit(code));
   if (args.includes('--help') || args.includes('-h')) {
-    printHelp();
+    printMigrateEmbeddingsHelp();
     exit(0);
   }
   const flags = parseMigrateEmbeddingsFlags(args);

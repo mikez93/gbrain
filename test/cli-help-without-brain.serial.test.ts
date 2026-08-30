@@ -12,7 +12,8 @@
  * run with an empty GBRAIN_HOME.
  */
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -33,6 +34,7 @@ const HELP_WITHOUT_BRAIN = [
   // (SELF_HELP_WITHOUT_ENGINE loader, same shape as dream/jobs).
   'compile-context',
   'sources',
+  'migrate',
   // cathedral-6: agent answers --help (incl. `register --help`) engine-free.
   'agent',
   // ZE interim cleanup: the retired ze-switch shim answers --help engine-free
@@ -52,7 +54,6 @@ const STILL_NEEDS_A_BRAIN = [
   'config',
   'embed',
   'lsd',
-  'migrate',
   'pages',
   'retrieval-upgrade',
 ];
@@ -84,6 +85,67 @@ async function runHelp(command: string): Promise<{ code: number; out: string }> 
 }
 
 describe('--help without a configured brain', () => {
+  test('migrate help forms never connect to or mutate a configured brain', async () => {
+    let connections = 0;
+    const server = createServer(socket => {
+      connections += 1;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+
+    try {
+      const address = server.address();
+      expect(address && typeof address === 'object').toBe(true);
+      if (!address || typeof address === 'string') throw new Error('TCP sentinel has no port');
+
+      const home = mkdtempSync(join(tmpdir(), 'gbrain-migrate-help-safe-'));
+      const brainDir = join(home, '.gbrain');
+      const configPath = join(brainDir, 'config.json');
+      mkdirSync(brainDir, { recursive: true });
+      writeFileSync(configPath, JSON.stringify({
+        engine: 'postgres',
+        database_url: `postgresql://postgres:postgres@127.0.0.1:${address.port}/gbrain_test`,
+      }) + '\n');
+      const configBefore = readFileSync(configPath);
+      const filesBefore = readdirSync(brainDir).sort();
+
+      for (const migrateArgs of [['--help'], ['-h'], ['embeddings', '--help']]) {
+        const env: Record<string, string | undefined> = {
+          ...process.env,
+          HOME: home,
+          GBRAIN_HOME: home,
+          GBRAIN_SKIP_STARTUP_HOOKS: '1',
+          NODE_ENV: 'test',
+        };
+        delete env.GBRAIN_DATABASE_URL;
+        delete env.DATABASE_URL;
+        const proc = Bun.spawn(
+          ['bun', '--no-env-file', 'run', 'src/cli.ts', 'migrate', ...migrateArgs],
+          { cwd: REPO, env, stdout: 'pipe', stderr: 'pipe' },
+        );
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        expect(code).toBe(0);
+        expect(stdout).toContain('Usage: gbrain migrate');
+        if (migrateArgs[0] === 'embeddings') expect(stdout).toContain('--reranker');
+        expect(stderr).not.toContain('No brain configured');
+      }
+
+      await Bun.sleep(20);
+      expect(connections).toBe(0);
+      expect(readFileSync(configPath)).toEqual(configBefore);
+      expect(readdirSync(brainDir).sort()).toEqual(filesBefore);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  }, 30_000);
+
   // cathedral-6: the register SUBCOMMAND help must also answer brainless —
   // the whole point of the SELF_HELP_WITHOUT_ENGINE entry is that a reader on
   // a fresh machine can discover the mint flow before they have a brain.

@@ -218,6 +218,8 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, () => Promise<(engine: never, arg
   'extract-conversation-facts': async () =>
     (await import('./commands/extract-conversation-facts.ts')).runExtractConversationFacts as never,
   transcripts: async () => (await import('./commands/transcripts.ts')).runTranscripts as never,
+  // A pending migration makes engine initialization unsafe on help paths.
+  migrate: async () => (await import('./commands/migrate-help.ts')).runMigrateHelp as never,
   // runJobs accepts BrainEngine | null and its help guard returns before any
   // engine (or subcommand body) is touched.
   jobs: async () => (await import('./commands/jobs.ts')).runJobs as never,
@@ -2840,11 +2842,8 @@ async function handleCliOnly(command: string, args: string[]) {
           break;
         }
         if (args.includes('--help') || args.includes('-h')) {
-          console.log('Usage: gbrain migrate --to <supabase|pglite> [--url <url>] [--path <path>] [--force]');
-          console.log('       gbrain migrate embeddings --to <provider:model> [--dim N] [--dry-run] [--yes]');
-          console.log('');
-          console.log('The first form transfers the brain between engines; the second re-embeds');
-          console.log('onto a different embedding provider (run `gbrain migrate embeddings --help`).');
+          const { printMigrateHelp } = await import('./commands/migrate-help.ts');
+          printMigrateHelp();
           break;
         }
         const { runMigrateEngine } = await import('./commands/migrate-engine.ts');
