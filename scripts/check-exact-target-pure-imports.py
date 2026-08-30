@@ -103,6 +103,7 @@ def inspect(repo, roots, profile):
     source_hashes = {}
     violations = []
     ast_binding = None
+    ast_runs = []
 
     while pending:
         batch = sorted(set(pending) - set(resolved))
@@ -110,6 +111,21 @@ def inspect(repo, roots, profile):
         if not batch:
             break
         scans, ast_binding = run_ast_scanner(repo, batch)
+        ast_command = ["bun", "scripts/exact-target-typescript-ast.ts", "--json"]
+        for ast_path in batch:
+            ast_command.extend(["--scan-file", ast_path])
+        ast_runs.append(
+            {
+                "module_batch": batch,
+                "command_argv_sha256": sha256_bytes(
+                    canonical(ast_command).encode("utf-8")
+                ),
+                "evidence_sha256": ast_binding.get("evidence_sha256"),
+                "loader": ast_binding.get("loader"),
+                "fixtures": ast_binding.get("fixtures"),
+                "parser_errors": ast_binding.get("parser_errors"),
+            }
+        )
         by_label = {scan.get("label"): scan for scan in scans}
         for relative in batch:
             path, _, data = safe_repo_file(repo, relative)
@@ -170,6 +186,7 @@ def inspect(repo, roots, profile):
             (repo / "scripts/exact-target-typescript-ast.ts").read_bytes()
         ),
         "ast_evidence_sha256": ast_binding.get("evidence_sha256") if ast_binding else None,
+        "ast_runs": ast_runs,
         "forbidden_matches": sorted(
             violations,
             key=lambda item: canonical(item),

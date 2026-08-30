@@ -238,7 +238,17 @@ function compact(text: string): string {
   return text.replace(/\s+/g, '');
 }
 
-function violationForNode(node: SyntaxNode): string | null {
+function requireAliasName(node: SyntaxNode): string | null {
+  if (node.type !== 'variable_declarator') return null;
+  return node.text.match(
+    /^\s*([A-Za-z_$][\w$]*)\s*=\s*require\s*;?\s*$/,
+  )?.[1] ?? null;
+}
+
+function violationForNode(
+  node: SyntaxNode,
+  requireAliases: ReadonlySet<string>,
+): string | null {
   const text = compact(node.text);
   if (node.type === 'call_expression' && /^import(?:\?\.)?\(/.test(text)) {
     return 'dynamic_import';
@@ -265,10 +275,13 @@ function violationForNode(node: SyntaxNode): string | null {
   }
   if (
     node.type === 'call_expression' &&
-    /^(?:require|[A-Za-z_$][\w$]*)(?:\?\.)?\(/.test(text) &&
     /^require(?:\?\.)?\(/.test(text)
   ) {
     return 'require_call';
+  }
+  if (node.type === 'call_expression') {
+    const callee = text.match(/^([A-Za-z_$][\w$]*)(?:\?\.)?\(/)?.[1];
+    if (callee && requireAliases.has(callee)) return 'aliased_require_call';
   }
   if (
     (node.type === 'member_expression' ||
@@ -321,6 +334,11 @@ export function scanTypeScriptSource(
   try {
     const imports = new Set<string>();
     const violations: AstViolation[] = [];
+    const requireAliases = new Set<string>();
+    walk(tree.rootNode, (node) => {
+      const alias = requireAliasName(node);
+      if (alias) requireAliases.add(alias);
+    });
     walk(tree.rootNode, (node) => {
       if (node.type === 'import_statement' || node.type === 'export_statement') {
         const specifier = stringSpecifier(node);
@@ -337,7 +355,16 @@ export function scanTypeScriptSource(
           }
         }
       }
-      const kind = violationForNode(node);
+      const requireAlias = requireAliasName(node);
+      if (requireAlias) {
+        violations.push({
+          kind: 'forbidden_require_alias',
+          text: requireAlias,
+          start: node.startIndex,
+          end: node.endIndex,
+        });
+      }
+      const kind = violationForNode(node, requireAliases);
       if (kind) {
         violations.push({
           kind,

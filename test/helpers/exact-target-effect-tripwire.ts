@@ -1,5 +1,6 @@
 import { resolve } from 'node:path';
 import { createContext, SourceTextModule } from 'node:vm';
+import { EXACT_TARGET_FORBIDDEN_CASES } from '../fixtures/exact-target-forbidden-effects/cases.ts';
 
 const EFFECT_SURFACES = [
   'Bun.env',
@@ -76,6 +77,32 @@ export interface PositiveControlResult {
   readonly exitCode: number;
   readonly receipt: RuntimeChildReceipt;
   readonly stderr: string;
+}
+
+export interface RuntimeSuiteReceipt {
+  readonly schema: string;
+  readonly pass: boolean;
+  readonly fixture_count: number;
+  readonly isolated_child_count: number;
+  readonly distinct_child_pid_count: number;
+  readonly required_stubs_per_child: number;
+  readonly total_stub_installs: number;
+  readonly all_children_stubbed: boolean;
+  readonly rejection_count: number;
+  readonly executor_invocations: number;
+  readonly effect_total: number;
+  readonly effect_vector: EffectVector;
+  readonly positive_control: {
+    readonly pass: boolean;
+    readonly stubs_installed: boolean;
+    readonly required_stubs: number;
+    readonly executor_invocations: number;
+    readonly effect_total: number;
+    readonly effect_vector: EffectVector;
+    readonly throw_observed: boolean;
+    readonly harmless_source_evaluated: boolean;
+    readonly dangerous_source_evaluated: false;
+  };
 }
 
 function emptyEffectVector(): EffectVector {
@@ -395,8 +422,73 @@ export function runHarmlessPositiveControl(): PositiveControlResult {
   };
 }
 
+export function createRuntimeSuiteReceipt(): RuntimeSuiteReceipt {
+  const rejected = runRejectedEffectTripwire(EXACT_TARGET_FORBIDDEN_CASES);
+  const positive = runHarmlessPositiveControl().receipt;
+  const allChildrenStubbed = rejected.children.every(
+    (child) =>
+      child.pass &&
+      child.stubs_installed &&
+      child.stub_install_count === child.required_stub_count,
+  );
+  const positivePass =
+    positive.pass &&
+    positive.stubs_installed &&
+    positive.required_stub_count === EFFECT_SURFACES.length &&
+    positive.executor_invocations === 1 &&
+    positive.effect_total === 1 &&
+    positive.effect_vector.fetch === 1 &&
+    positive.throw_observed &&
+    positive.harmless_positive_control_evaluated &&
+    !positive.dangerous_source_evaluated;
+  const pass =
+    rejected.exitCode === 0 &&
+    rejected.isolatedChildCount === EXACT_TARGET_FORBIDDEN_CASES.length &&
+    rejected.distinctChildPidCount === EXACT_TARGET_FORBIDDEN_CASES.length &&
+    rejected.requiredStubCountPerChild === EFFECT_SURFACES.length &&
+    rejected.stubInstallCount ===
+      EXACT_TARGET_FORBIDDEN_CASES.length * EFFECT_SURFACES.length &&
+    allChildrenStubbed &&
+    rejected.rejectionCount === EXACT_TARGET_FORBIDDEN_CASES.length &&
+    rejected.executorInvocationCount === 0 &&
+    rejected.effectCount === 0 &&
+    Object.values(rejected.effectVector).every((count) => count === 0) &&
+    positivePass;
+  return {
+    schema: 'gbrain.exact-target-runtime-tripwire-suite.v1',
+    pass,
+    fixture_count: EXACT_TARGET_FORBIDDEN_CASES.length,
+    isolated_child_count: rejected.isolatedChildCount,
+    distinct_child_pid_count: rejected.distinctChildPidCount,
+    required_stubs_per_child: rejected.requiredStubCountPerChild,
+    total_stub_installs: rejected.stubInstallCount,
+    all_children_stubbed: allChildrenStubbed,
+    rejection_count: rejected.rejectionCount,
+    executor_invocations: rejected.executorInvocationCount,
+    effect_total: rejected.effectCount,
+    effect_vector: rejected.effectVector,
+    positive_control: {
+      pass: positivePass,
+      stubs_installed: positive.stubs_installed,
+      required_stubs: positive.required_stub_count,
+      executor_invocations: positive.executor_invocations,
+      effect_total: positive.effect_total,
+      effect_vector: positive.effect_vector,
+      throw_observed: positive.throw_observed,
+      harmless_source_evaluated:
+        positive.harmless_positive_control_evaluated,
+      dangerous_source_evaluated: positive.dangerous_source_evaluated,
+    },
+  };
+}
+
 if (import.meta.main) {
   const [mode, encodedSource, encodedLabel] = process.argv.slice(2);
+  if (mode === '--suite') {
+    const receipt = createRuntimeSuiteReceipt();
+    process.stdout.write(`${JSON.stringify(receipt)}\n`);
+    process.exit(receipt.pass ? 0 : 1);
+  }
   if (
     (mode !== '--fixture-child' && mode !== '--positive-control-child') ||
     !encodedSource ||

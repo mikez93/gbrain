@@ -3,6 +3,12 @@ export interface ExactTargetForbiddenCase {
   readonly source: string;
 }
 
+/** Frozen direct falsifier for the manifest's aliased-require obligation. */
+export const EXACT_TARGET_ALIASED_REQUIRE_FALSIFIER = {
+  id: 'aliased-require',
+  source: "const r = require; r('fs');",
+} as const;
+
 /** One fixture for each accepted Order-0 static/runtime effect class. */
 export const EXACT_TARGET_FORBIDDEN_CASES: readonly ExactTargetForbiddenCase[] = [
   { id: 'bun-env', source: 'const value = Bun.env;' },
