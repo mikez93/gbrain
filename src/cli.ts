@@ -220,6 +220,7 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, () => Promise<(engine: never, arg
   transcripts: async () => (await import('./commands/transcripts.ts')).runTranscripts as never,
   // A pending migration makes engine initialization unsafe on help paths.
   migrate: async () => (await import('./commands/migrate-help.ts')).runMigrateHelp as never,
+  'retrieval-upgrade': async () => (await import('./commands/migrate-help.ts')).runRetrievalUpgradeHelp as never,
   // runJobs accepts BrainEngine | null and its help guard returns before any
   // engine (or subcommand body) is touched.
   jobs: async () => (await import('./commands/jobs.ts')).runJobs as never,

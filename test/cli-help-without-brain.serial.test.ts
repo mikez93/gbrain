@@ -35,6 +35,7 @@ const HELP_WITHOUT_BRAIN = [
   'compile-context',
   'sources',
   'migrate',
+  'retrieval-upgrade',
   // cathedral-6: agent answers --help (incl. `register --help`) engine-free.
   'agent',
   // ZE interim cleanup: the retired ze-switch shim answers --help engine-free
@@ -55,7 +56,6 @@ const STILL_NEEDS_A_BRAIN = [
   'embed',
   'lsd',
   'pages',
-  'retrieval-upgrade',
 ];
 
 async function runHelp(command: string): Promise<{ code: number; out: string }> {
@@ -112,7 +112,14 @@ describe('--help without a configured brain', () => {
       const configBefore = readFileSync(configPath);
       const filesBefore = readdirSync(brainDir).sort();
 
-      for (const migrateArgs of [['--help'], ['-h'], ['embeddings', '--help']]) {
+      for (const commandArgs of [
+        ['migrate', '--help'],
+        ['migrate', '-h'],
+        ['migrate', 'embeddings', '--help'],
+        ['migrate', 'embeddings', '-h'],
+        ['retrieval-upgrade', '--help'],
+        ['retrieval-upgrade', '-h'],
+      ]) {
         const env: Record<string, string | undefined> = {
           ...process.env,
           HOME: home,
@@ -123,7 +130,7 @@ describe('--help without a configured brain', () => {
         delete env.GBRAIN_DATABASE_URL;
         delete env.DATABASE_URL;
         const proc = Bun.spawn(
-          ['bun', '--no-env-file', 'run', 'src/cli.ts', 'migrate', ...migrateArgs],
+          ['bun', '--no-env-file', 'run', 'src/cli.ts', ...commandArgs],
           { cwd: REPO, env, stdout: 'pipe', stderr: 'pipe' },
         );
         const [stdout, stderr, code] = await Promise.all([
@@ -133,7 +140,9 @@ describe('--help without a configured brain', () => {
         ]);
         expect(code).toBe(0);
         expect(stdout).toContain('Usage: gbrain migrate');
-        if (migrateArgs[0] === 'embeddings') expect(stdout).toContain('--reranker');
+        if (commandArgs.includes('embeddings') || commandArgs[0] === 'retrieval-upgrade') {
+          expect(stdout).toContain('--reranker');
+        }
         expect(stderr).not.toContain('No brain configured');
       }
 

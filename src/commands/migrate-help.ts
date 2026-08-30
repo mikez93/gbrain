@@ -16,3 +16,9 @@ export async function runMigrateHelp(_engine: never, args: string[]): Promise<vo
   }
   printMigrateHelp();
 }
+
+export async function runRetrievalUpgradeHelp(_engine: never, _args: string[]): Promise<void> {
+  console.log('gbrain retrieval-upgrade is an alias for gbrain migrate embeddings.');
+  const { printMigrateEmbeddingsHelp } = await import('./migrate-embeddings.ts');
+  printMigrateEmbeddingsHelp();
+}
