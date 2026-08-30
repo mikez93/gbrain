@@ -204,7 +204,12 @@ describe('exact-target pure import boundary', () => {
     expect(summary.runtime_executor_invocations).toBe(0);
     expect(summary.runtime_effect_total).toBe(0);
     expect(summary.runtime_all_children_stubbed).toBe(true);
+    expect(summary.runtime_surface_control_count).toBe(26);
+    expect(summary.runtime_all_surface_controls_live).toBe(true);
     expect(summary.verified_loader_copy_count).toBe(2);
+    expect(summary.durable_reopen_verified).toBe(true);
+    expect(summary.durable_receipt_bytes).toBe(summary.receipt_bytes);
+    expect(summary.durable_receipt_sha256).toBe(summary.receipt_sha256);
     expect(runDirectory.isDirectory()).toBe(true);
     expect(runDirectory.mode & 0o777).toBe(0o700);
     expect(receiptInfo.isFile()).toBe(true);
@@ -376,6 +381,31 @@ describe('exact-target pure import boundary', () => {
     expect(
       Object.values(runtime.receipt.effect_vector).every((count) => count === 0),
     ).toBe(true);
+    expect(runtime.receipt.surface_control_count).toBe(26);
+    expect(runtime.receipt.surface_control_distinct_child_pid_count).toBe(26);
+    expect(runtime.receipt.surface_control_executor_invocations).toBe(26);
+    expect(runtime.receipt.surface_control_effect_total).toBe(26);
+    expect(runtime.receipt.all_surface_controls_live).toBe(true);
+    expect(runtime.receipt.surface_controls).toHaveLength(26);
+    expect(
+      Object.values(runtime.receipt.surface_control_effect_vector).every(
+        (count) => count === 1,
+      ),
+    ).toBe(true);
+    for (const control of runtime.receipt.surface_controls) {
+      expect(control.pass).toBe(true);
+      expect(control.expected_effect_surface).toBe(control.label);
+      expect(control.executor_invocations).toBe(1);
+      expect(control.effect_total).toBe(1);
+      expect(control.effect_vector[control.label]).toBe(1);
+      expect(
+        Object.entries(control.effect_vector)
+          .filter(([surface]) => surface !== control.label)
+          .every(([, count]) => count === 0),
+      ).toBe(true);
+      expect(control.throw_observed).toBe(true);
+      expect(control.dangerous_source_evaluated).toBe(false);
+    }
     expect(receipt.observed_counts).toEqual({
       static_forbidden_matches: 0,
       dynamic_import_matches: 0,
@@ -394,7 +424,7 @@ describe('exact-target pure import boundary', () => {
     expect(result.exitCode, result.stderr).toBe(0);
     const receipt = JSON.parse(result.stdout);
     expect(receipt.pass).toBe(true);
-    expect(receipt.case_count).toBe(9);
+    expect(receipt.case_count).toBe(11);
     expect(receipt.cases.map((entry: { name: string }) => entry.name)).toEqual([
       'precreated_receipt_regular_file',
       'receipt_symlink',
@@ -404,10 +434,12 @@ describe('exact-target pure import boundary', () => {
       'unsafe_run_directory_mode',
       'injected_effective_uid_owner_mismatch',
       'named_opened_inode_swap',
+      'short_write_then_no_progress',
+      'post_write_fsync_named_inode_swap',
       'two_overlapping_full_guard_invocations',
     ]);
     for (const entry of receipt.cases) expect(entry.pass).toBe(true);
-    const hostile = receipt.cases.slice(0, 8);
+    const hostile = receipt.cases.slice(0, 10);
     for (const entry of hostile) {
       expect(entry.expected_class).toBe('ReceiptSafetyError');
       expect(entry.observed_class).toBe(entry.expected_class);
@@ -420,7 +452,18 @@ describe('exact-target pure import boundary', () => {
     );
     expect(ownerMismatch.expected_reason).toBe('run_directory_owner_mismatch');
     expect(ownerMismatch.expected_seam).toBe('verify_run_directory');
-    const concurrency = receipt.cases[8];
+    const shortWrite = hostile.find(
+      (entry: { name: string }) => entry.name === 'short_write_then_no_progress',
+    );
+    expect(shortWrite.expected_reason).toBe('receipt_write_no_progress');
+    expect(shortWrite.expected_seam).toBe('write_receipt_body');
+    const durableSwap = hostile.find(
+      (entry: { name: string }) =>
+        entry.name === 'post_write_fsync_named_inode_swap',
+    );
+    expect(durableSwap.expected_reason).toBe('durable_named_inode_mismatch');
+    expect(durableSwap.expected_seam).toBe('verify_durable_receipt');
+    const concurrency = receipt.cases[10];
     expect(concurrency.barrier_parties).toBe(2);
     expect(concurrency.full_guard_invocations).toBe(2);
     expect(concurrency.both_complete_bindings).toBe(true);

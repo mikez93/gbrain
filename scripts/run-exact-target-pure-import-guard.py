@@ -105,10 +105,19 @@ def verify_directory(path, expected_uid=None):
     return info
 
 
-def publish_exclusive(run_dir, body, after_open_hook=None, expected_uid=None):
+def publish_exclusive(
+    run_dir,
+    body,
+    after_open_hook=None,
+    expected_uid=None,
+    write_hook=None,
+    after_file_fsync_hook=None,
+):
     expected_owner = os.geteuid() if expected_uid is None else expected_uid
     directory_info = verify_directory(run_dir, expected_owner)
     directory_fd = os.open(str(run_dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    durable = None
+    durable_bytes = None
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -135,20 +144,101 @@ def publish_exclusive(run_dir, body, after_open_hook=None, expected_uid=None):
                 raise ReceiptSafetyError(
                     "opened_named_inode_mismatch", "verify_opened_receipt"
                 )
-            os.write(receipt_fd, body)
+            writer = os.write if write_hook is None else write_hook
+            offset = 0
+            while offset < len(body):
+                written = writer(receipt_fd, body[offset:])
+                if not isinstance(written, int) or written <= 0:
+                    raise ReceiptSafetyError(
+                        "receipt_write_no_progress", "write_receipt_body"
+                    )
+                if written > len(body) - offset:
+                    raise ReceiptSafetyError(
+                        "receipt_write_count_invalid", "write_receipt_body"
+                    )
+                offset += written
             os.fsync(receipt_fd)
+            if after_file_fsync_hook is not None:
+                after_file_fsync_hook(run_dir, receipt_fd, directory_fd)
+            os.fsync(directory_fd)
+
+            reopen_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                durable_fd = os.open(
+                    "receipt.json", reopen_flags, dir_fd=directory_fd
+                )
+            except OSError as error:
+                raise ReceiptSafetyError(
+                    "durable_receipt_reopen_failed", "reopen_durable_receipt"
+                ) from error
+            try:
+                durable = os.fstat(durable_fd)
+                durable_named = os.stat(
+                    "receipt.json", dir_fd=directory_fd, follow_symlinks=False
+                )
+                if not stat.S_ISREG(durable.st_mode):
+                    raise ReceiptSafetyError(
+                        "durable_receipt_not_regular", "verify_durable_receipt"
+                    )
+                if durable.st_uid != expected_owner:
+                    raise ReceiptSafetyError(
+                        "durable_receipt_owner_mismatch", "verify_durable_receipt"
+                    )
+                if stat.S_IMODE(durable.st_mode) != 0o600:
+                    raise ReceiptSafetyError(
+                        "durable_receipt_mode_mismatch", "verify_durable_receipt"
+                    )
+                if durable.st_nlink != 1:
+                    raise ReceiptSafetyError(
+                        "durable_receipt_link_count", "verify_durable_receipt"
+                    )
+                if (
+                    durable.st_dev != durable_named.st_dev
+                    or durable.st_ino != durable_named.st_ino
+                    or durable.st_dev != opened.st_dev
+                    or durable.st_ino != opened.st_ino
+                ):
+                    raise ReceiptSafetyError(
+                        "durable_named_inode_mismatch", "verify_durable_receipt"
+                    )
+                chunks = []
+                while True:
+                    chunk = os.read(durable_fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                durable_bytes = b"".join(chunks)
+                if durable.st_size != len(body) or len(durable_bytes) != len(body):
+                    raise ReceiptSafetyError(
+                        "durable_receipt_size_mismatch", "verify_durable_receipt"
+                    )
+                if (
+                    durable_bytes != body
+                    or sha256_bytes(durable_bytes) != sha256_bytes(body)
+                ):
+                    raise ReceiptSafetyError(
+                        "durable_receipt_hash_mismatch", "verify_durable_receipt"
+                    )
+            finally:
+                os.close(durable_fd)
         finally:
             os.close(receipt_fd)
-        os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+    if durable is None or durable_bytes is None:
+        raise ReceiptSafetyError(
+            "durable_receipt_verification_missing", "verify_durable_receipt"
+        )
     return {
         "run_directory_dev": directory_info.st_dev,
         "run_directory_ino": directory_info.st_ino,
-        "receipt_dev": named.st_dev,
-        "receipt_ino": named.st_ino,
+        "receipt_dev": durable.st_dev,
+        "receipt_ino": durable.st_ino,
         "run_directory_mode": "0700",
         "receipt_mode": "0600",
+        "durable_reopen_verified": True,
+        "durable_receipt_bytes": len(durable_bytes),
+        "durable_receipt_sha256": sha256_bytes(durable_bytes),
     }
 
 
@@ -302,6 +392,33 @@ def run_runtime_tripwire(repo):
         or not isinstance(effect_vector, dict)
         or len(effect_vector) != 26
         or any(value != 0 for value in effect_vector.values())
+        or receipt.get("surface_control_count") != 26
+        or receipt.get("surface_control_distinct_child_pid_count") != 26
+        or receipt.get("surface_control_executor_invocations") != 26
+        or receipt.get("surface_control_effect_total") != 26
+        or not receipt.get("all_surface_controls_live")
+        or not isinstance(receipt.get("surface_control_effect_vector"), dict)
+        or len(receipt["surface_control_effect_vector"]) != 26
+        or any(
+            value != 1
+            for value in receipt["surface_control_effect_vector"].values()
+        )
+        or not isinstance(receipt.get("surface_controls"), list)
+        or len(receipt["surface_controls"]) != 26
+        or any(
+            not control.get("pass")
+            or control.get("expected_effect_surface") != control.get("label")
+            or control.get("executor_invocations") != 1
+            or control.get("effect_total") != 1
+            or control.get("effect_vector", {}).get(control.get("label")) != 1
+            or any(
+                value != (1 if surface == control.get("label") else 0)
+                for surface, value in control.get("effect_vector", {}).items()
+            )
+            or not control.get("throw_observed")
+            or control.get("dangerous_source_evaluated")
+            for control in receipt["surface_controls"]
+        )
         or not isinstance(positive, dict)
         or not positive.get("pass")
         or positive.get("executor_invocations") != 1
@@ -407,6 +524,12 @@ def execute_full_guard(
         "runtime_fixture_count": runtime["receipt"]["fixture_count"],
         "runtime_executor_invocations": runtime["receipt"]["executor_invocations"],
         "runtime_effect_total": runtime_effects,
+        "runtime_surface_control_count": runtime["receipt"][
+            "surface_control_count"
+        ],
+        "runtime_all_surface_controls_live": runtime["receipt"][
+            "all_surface_controls_live"
+        ],
         "runtime_all_children_stubbed": runtime["receipt"]["all_children_stubbed"],
         "verified_loader_copy_count": sum(
             len(run.get("ast_runs", [])) for run in guards
@@ -569,6 +692,64 @@ def receipt_safety_self_test():
             )
         )
 
+        short_write = create_owner_temp_run_directory(parent)
+        short_write_state = {"calls": 0}
+
+        def short_then_stall(receipt_fd, remaining):
+            short_write_state["calls"] += 1
+            if short_write_state["calls"] == 1:
+                partial = max(1, len(remaining) - 1)
+                return os.write(receipt_fd, remaining[:partial])
+            return 0
+
+        cases.append(
+            expect_rejected(
+                "short_write_then_no_progress",
+                lambda: publish_exclusive(
+                    short_write, body, write_hook=short_then_stall
+                ),
+                "receipt_write_no_progress",
+                "write_receipt_body",
+            )
+        )
+
+        post_write_swap = create_owner_temp_run_directory(parent)
+
+        def swap_after_file_fsync(run_dir, _receipt_fd, directory_fd):
+            os.rename(
+                str(run_dir / "receipt.json"),
+                str(run_dir / "durable-original"),
+            )
+            replacement_fd = os.open(
+                "receipt.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                os.fchmod(replacement_fd, 0o600)
+                replacement_offset = 0
+                while replacement_offset < len(body):
+                    replacement_offset += os.write(
+                        replacement_fd, body[replacement_offset:]
+                    )
+                os.fsync(replacement_fd)
+            finally:
+                os.close(replacement_fd)
+
+        cases.append(
+            expect_rejected(
+                "post_write_fsync_named_inode_swap",
+                lambda: publish_exclusive(
+                    post_write_swap,
+                    body,
+                    after_file_fsync_hook=swap_after_file_fsync,
+                ),
+                "durable_named_inode_mismatch",
+                "verify_durable_receipt",
+            )
+        )
+
         roots = [
             "src/core/minions/exact-target-contract.ts",
             "src/core/minions/exact-target-pure-types.ts",
@@ -637,6 +818,10 @@ def receipt_safety_self_test():
                 and summary["receipt_ino"] > 0
                 and summary["run_directory_dev"] > 0
                 and summary["run_directory_ino"] > 0
+                and summary["durable_reopen_verified"]
+                and summary["durable_receipt_bytes"] == len(receipt_body)
+                and summary["durable_receipt_sha256"]
+                == sha256_bytes(receipt_body)
             )
             return {
                 "summary": summary,
@@ -715,7 +900,7 @@ def receipt_safety_self_test():
 
     result = {
         "schema": "gbrain.exact-target-receipt-safety-self-test.v1",
-        "pass": len(cases) == 9
+        "pass": len(cases) == 11
         and all(case["pass"] for case in cases)
         and oracle_falsifier["pass"],
         "case_count": len(cases),

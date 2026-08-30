@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { EXACT_TARGET_FORBIDDEN_CASES } from './fixtures/exact-target-forbidden-effects/cases.ts';
 import {
-  runHarmlessPositiveControl,
   runRejectedEffectTripwire,
+  runSurfacePositiveControls,
 } from './helpers/exact-target-effect-tripwire.ts';
 
 describe('exact-target effect tripwire', () => {
@@ -47,28 +47,38 @@ describe('exact-target effect tripwire', () => {
     }
   });
 
-  test('harmless positive-control child proves the guarded counter and throw path red', () => {
-    const result = runHarmlessPositiveControl();
-    const { receipt } = result;
-
+  test('26 isolated cause-bound controls prove every stub counter and throw path live', () => {
+    const result = runSurfacePositiveControls();
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe('');
-    expect(receipt.pass).toBe(true);
-    expect(receipt.positive_control).toBe(true);
-    expect(receipt.stubs_installed).toBe(true);
-    expect(receipt.required_stub_count).toBe(26);
-    expect(receipt.stub_install_count).toBe(receipt.required_stub_count);
-    expect(receipt.rejection_observed).toBe(false);
-    expect(receipt.executor_invocations).toBe(1);
-    expect(receipt.effect_total).toBe(1);
-    expect(receipt.effect_vector.fetch).toBe(1);
-    expect(
-      Object.entries(receipt.effect_vector)
-        .filter(([surface]) => surface !== 'fetch')
-        .every(([, count]) => count === 0),
-    ).toBe(true);
-    expect(receipt.throw_observed).toBe(true);
-    expect(receipt.dangerous_source_evaluated).toBe(false);
-    expect(receipt.harmless_positive_control_evaluated).toBe(true);
+    expect(result.controlCount).toBe(26);
+    expect(result.distinctChildPidCount).toBe(26);
+    expect(result.executorInvocationCount).toBe(26);
+    expect(result.effectCount).toBe(26);
+    expect(Object.values(result.effectVector).every((count) => count === 1)).toBe(
+      true,
+    );
+    expect(result.allControlsLive).toBe(true);
+    expect(result.children).toHaveLength(26);
+    for (const receipt of result.children) {
+      expect(receipt.pass).toBe(true);
+      expect(receipt.positive_control).toBe(true);
+      expect(receipt.expected_effect_surface).not.toBeNull();
+      expect(receipt.stubs_installed).toBe(true);
+      expect(receipt.required_stub_count).toBe(26);
+      expect(receipt.stub_install_count).toBe(receipt.required_stub_count);
+      expect(receipt.rejection_observed).toBe(false);
+      expect(receipt.executor_invocations).toBe(1);
+      expect(receipt.effect_total).toBe(1);
+      expect(receipt.effect_vector[receipt.expected_effect_surface!]).toBe(1);
+      expect(
+        Object.entries(receipt.effect_vector)
+          .filter(([surface]) => surface !== receipt.expected_effect_surface)
+          .every(([, count]) => count === 0),
+      ).toBe(true);
+      expect(receipt.throw_observed).toBe(true);
+      expect(receipt.dangerous_source_evaluated).toBe(false);
+      expect(receipt.harmless_positive_control_evaluated).toBe(true);
+    }
   });
 });

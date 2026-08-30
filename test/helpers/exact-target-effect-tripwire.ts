@@ -34,6 +34,35 @@ const EFFECT_SURFACES = [
 type EffectSurface = (typeof EFFECT_SURFACES)[number];
 type EffectVector = Record<EffectSurface, number>;
 
+const EFFECT_POSITIVE_CONTROLS: Record<EffectSurface, string> = {
+  'Bun.env': 'Bun.env;',
+  'Bun.file': 'Bun.file("tripwire");',
+  'Bun.write': 'Bun.write("tripwire", "harmless");',
+  'Bun.spawn': 'Bun.spawn(["tripwire"]);',
+  'Bun.spawnSync': 'Bun.spawnSync(["tripwire"]);',
+  'Bun.connect': 'Bun.connect({});',
+  'Bun.listen': 'Bun.listen({});',
+  'Bun.serve': 'Bun.serve({});',
+  fetch: 'fetch("tripwire://harmless");',
+  WebSocket: 'new WebSocket("tripwire://harmless");',
+  'import.meta.env': 'import.meta.env;',
+  'process.env': 'process.env;',
+  'process.exit': 'process.exit(0);',
+  eval: 'eval("0");',
+  Function: 'Function("return 0");',
+  AsyncFunction: 'new AsyncFunction("return 0");',
+  GeneratorFunction: 'new GeneratorFunction("yield 0");',
+  'WebAssembly.compile': 'WebAssembly.compile(new Uint8Array());',
+  'WebAssembly.instantiate': 'WebAssembly.instantiate(new Uint8Array());',
+  'dynamic import': 'await import("data:text/javascript,export default 0");',
+  require: 'require("fs");',
+  filesystem: 'fs.readFile("tripwire");',
+  'network.net': 'net.connect({});',
+  'network.http': 'http.get("tripwire://harmless");',
+  'network.https': 'https.get("tripwire://harmless");',
+  child_process: 'child_process.spawn("tripwire");',
+};
+
 interface AstScan {
   readonly label: string;
   readonly violations: readonly { readonly kind: string }[];
@@ -46,6 +75,7 @@ export interface RuntimeChildReceipt {
   readonly pid: number;
   readonly pass: boolean;
   readonly positive_control: boolean;
+  readonly expected_effect_surface: EffectSurface | null;
   readonly stubs_installed: boolean;
   readonly stub_install_count: number;
   readonly required_stub_count: number;
@@ -79,6 +109,18 @@ export interface PositiveControlResult {
   readonly stderr: string;
 }
 
+export interface SurfaceControlResult {
+  readonly exitCode: number;
+  readonly controlCount: number;
+  readonly distinctChildPidCount: number;
+  readonly executorInvocationCount: number;
+  readonly effectCount: number;
+  readonly effectVector: EffectVector;
+  readonly allControlsLive: boolean;
+  readonly children: readonly RuntimeChildReceipt[];
+  readonly stderr: string;
+}
+
 export interface RuntimeSuiteReceipt {
   readonly schema: string;
   readonly pass: boolean;
@@ -92,6 +134,13 @@ export interface RuntimeSuiteReceipt {
   readonly executor_invocations: number;
   readonly effect_total: number;
   readonly effect_vector: EffectVector;
+  readonly surface_control_count: number;
+  readonly surface_control_distinct_child_pid_count: number;
+  readonly surface_control_executor_invocations: number;
+  readonly surface_control_effect_total: number;
+  readonly surface_control_effect_vector: EffectVector;
+  readonly all_surface_controls_live: boolean;
+  readonly surface_controls: readonly RuntimeChildReceipt[];
   readonly positive_control: {
     readonly pass: boolean;
     readonly stubs_installed: boolean;
@@ -281,7 +330,7 @@ async function guardedExecute(
 async function runRuntimeChild(
   source: string,
   label: string,
-  positiveControl: boolean,
+  expectedEffectSurface: EffectSurface | null,
 ): Promise<RuntimeChildReceipt> {
   const {
     sandbox,
@@ -290,6 +339,7 @@ async function runRuntimeChild(
     initializeImportMeta,
     dynamicModuleStub,
   } = installThrowingEffectSandbox();
+  const positiveControl = expectedEffectSurface !== null;
   const scanResult = positiveControl
     ? { exitCode: 0, scan: null }
     : runAstScan(source);
@@ -319,7 +369,11 @@ async function runRuntimeChild(
       executorInvocations === 1 &&
       throwObserved &&
       effectTotal === 1 &&
-      effects.fetch === 1
+      effects[expectedEffectSurface] === 1 &&
+      EFFECT_SURFACES.every(
+        (surface) =>
+          effects[surface] === (surface === expectedEffectSurface ? 1 : 0),
+      )
     : stubInstallCount === EFFECT_SURFACES.length &&
       rejectionObserved &&
       executorInvocations === 0 &&
@@ -330,6 +384,7 @@ async function runRuntimeChild(
     pid: process.pid,
     pass,
     positive_control: positiveControl,
+    expected_effect_surface: expectedEffectSurface,
     stubs_installed: stubInstallCount === EFFECT_SURFACES.length,
     stub_install_count: stubInstallCount,
     required_stub_count: EFFECT_SURFACES.length,
@@ -347,15 +402,19 @@ async function runRuntimeChild(
 function runChildProcess(
   source: string,
   label: string,
-  positiveControl = false,
+  expectedEffectSurface: EffectSurface | null = null,
 ): { exitCode: number; receipt: RuntimeChildReceipt; stderr: string } {
+  const positiveControl = expectedEffectSurface !== null;
   const child = Bun.spawnSync(
     [
       process.execPath,
       resolve('test/helpers/exact-target-effect-tripwire.ts'),
-      positiveControl ? '--positive-control-child' : '--fixture-child',
+      positiveControl ? '--surface-control-child' : '--fixture-child',
       Buffer.from(source).toString('base64'),
       Buffer.from(label).toString('base64'),
+      ...(expectedEffectSurface
+        ? [Buffer.from(expectedEffectSurface).toString('base64')]
+        : []),
     ],
     {
       cwd: process.cwd(),
@@ -410,11 +469,7 @@ export function runRejectedEffectTripwire(
 }
 
 export function runHarmlessPositiveControl(): PositiveControlResult {
-  const result = runChildProcess(
-    'fetch("tripwire://harmless-positive-control")',
-    'harmless-positive-control',
-    true,
-  );
+  const result = runChildProcess(EFFECT_POSITIVE_CONTROLS.fetch, 'fetch', 'fetch');
   return {
     exitCode: result.exitCode,
     receipt: result.receipt,
@@ -422,9 +477,58 @@ export function runHarmlessPositiveControl(): PositiveControlResult {
   };
 }
 
+export function runSurfacePositiveControls(): SurfaceControlResult {
+  const children = EFFECT_SURFACES.map((surface) =>
+    runChildProcess(EFFECT_POSITIVE_CONTROLS[surface], surface, surface),
+  );
+  const receipts = children.map((child) => child.receipt);
+  const effectVector = emptyEffectVector();
+  for (const receipt of receipts) {
+    for (const surface of EFFECT_SURFACES) {
+      effectVector[surface] += receipt.effect_vector[surface];
+    }
+  }
+  const allControlsLive = receipts.every(
+    (receipt) =>
+      receipt.pass &&
+      receipt.positive_control &&
+      receipt.expected_effect_surface !== null &&
+      receipt.stubs_installed &&
+      receipt.stub_install_count === receipt.required_stub_count &&
+      receipt.executor_invocations === 1 &&
+      receipt.effect_total === 1 &&
+      receipt.effect_vector[receipt.expected_effect_surface] === 1 &&
+      EFFECT_SURFACES.every(
+        (surface) =>
+          receipt.effect_vector[surface] ===
+          (surface === receipt.expected_effect_surface ? 1 : 0),
+      ) &&
+      receipt.throw_observed &&
+      receipt.harmless_positive_control_evaluated &&
+      !receipt.dangerous_source_evaluated,
+  );
+  return {
+    exitCode: children.every((child) => child.exitCode === 0) ? 0 : 1,
+    controlCount: receipts.length,
+    distinctChildPidCount: new Set(receipts.map((receipt) => receipt.pid)).size,
+    executorInvocationCount: receipts.reduce(
+      (total, receipt) => total + receipt.executor_invocations,
+      0,
+    ),
+    effectCount: totalEffects(effectVector),
+    effectVector,
+    allControlsLive,
+    children: receipts,
+    stderr: children.map((child) => child.stderr).filter(Boolean).join('\n'),
+  };
+}
+
 export function createRuntimeSuiteReceipt(): RuntimeSuiteReceipt {
   const rejected = runRejectedEffectTripwire(EXACT_TARGET_FORBIDDEN_CASES);
-  const positive = runHarmlessPositiveControl().receipt;
+  const controls = runSurfacePositiveControls();
+  const positive = controls.children.find(
+    (child) => child.expected_effect_surface === 'fetch',
+  )!;
   const allChildrenStubbed = rejected.children.every(
     (child) =>
       child.pass &&
@@ -433,6 +537,7 @@ export function createRuntimeSuiteReceipt(): RuntimeSuiteReceipt {
   );
   const positivePass =
     positive.pass &&
+    positive.expected_effect_surface === 'fetch' &&
     positive.stubs_installed &&
     positive.required_stub_count === EFFECT_SURFACES.length &&
     positive.executor_invocations === 1 &&
@@ -453,6 +558,13 @@ export function createRuntimeSuiteReceipt(): RuntimeSuiteReceipt {
     rejected.executorInvocationCount === 0 &&
     rejected.effectCount === 0 &&
     Object.values(rejected.effectVector).every((count) => count === 0) &&
+    controls.exitCode === 0 &&
+    controls.controlCount === EFFECT_SURFACES.length &&
+    controls.distinctChildPidCount === EFFECT_SURFACES.length &&
+    controls.executorInvocationCount === EFFECT_SURFACES.length &&
+    controls.effectCount === EFFECT_SURFACES.length &&
+    EFFECT_SURFACES.every((surface) => controls.effectVector[surface] === 1) &&
+    controls.allControlsLive &&
     positivePass;
   return {
     schema: 'gbrain.exact-target-runtime-tripwire-suite.v1',
@@ -467,6 +579,13 @@ export function createRuntimeSuiteReceipt(): RuntimeSuiteReceipt {
     executor_invocations: rejected.executorInvocationCount,
     effect_total: rejected.effectCount,
     effect_vector: rejected.effectVector,
+    surface_control_count: controls.controlCount,
+    surface_control_distinct_child_pid_count: controls.distinctChildPidCount,
+    surface_control_executor_invocations: controls.executorInvocationCount,
+    surface_control_effect_total: controls.effectCount,
+    surface_control_effect_vector: controls.effectVector,
+    all_surface_controls_live: controls.allControlsLive,
+    surface_controls: controls.children,
     positive_control: {
       pass: positivePass,
       stubs_installed: positive.stubs_installed,
@@ -483,27 +602,31 @@ export function createRuntimeSuiteReceipt(): RuntimeSuiteReceipt {
 }
 
 if (import.meta.main) {
-  const [mode, encodedSource, encodedLabel] = process.argv.slice(2);
+  const [mode, encodedSource, encodedLabel, encodedSurface] = process.argv.slice(2);
   if (mode === '--suite') {
     const receipt = createRuntimeSuiteReceipt();
     process.stdout.write(`${JSON.stringify(receipt)}\n`);
     process.exit(receipt.pass ? 0 : 1);
   }
   if (
-    (mode !== '--fixture-child' && mode !== '--positive-control-child') ||
+    (mode !== '--fixture-child' && mode !== '--surface-control-child') ||
     !encodedSource ||
-    !encodedLabel
+    !encodedLabel ||
+    (mode === '--surface-control-child' && !encodedSurface)
   ) {
     process.stderr.write('invalid runtime tripwire child invocation\n');
     process.exit(2);
   }
   const source = Buffer.from(encodedSource, 'base64').toString('utf8');
   const label = Buffer.from(encodedLabel, 'base64').toString('utf8');
-  const receipt = await runRuntimeChild(
-    source,
-    label,
-    mode === '--positive-control-child',
-  );
+  const surface = encodedSurface
+    ? Buffer.from(encodedSurface, 'base64').toString('utf8')
+    : null;
+  if (surface !== null && !EFFECT_SURFACES.includes(surface as EffectSurface)) {
+    process.stderr.write('invalid runtime tripwire surface\n');
+    process.exit(2);
+  }
+  const receipt = await runRuntimeChild(source, label, surface as EffectSurface | null);
   process.stdout.write(`${JSON.stringify(receipt)}\n`);
   process.exit(receipt.pass ? 0 : 1);
 }
