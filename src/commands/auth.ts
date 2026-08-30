@@ -738,9 +738,9 @@ export async function registerScopedClient(
     });
     fleetGrant = rescoped.fleetGrant!;
     fleetGrantVersion = rescoped.fleetGrantVersion!;
-    fleetGrantSetBy = rescoped.fleetGrantSetBy;
-    fleetGrantSetAt = rescoped.fleetGrantSetAt;
-    fleetGrantEventId = rescoped.fleetGrantEventId;
+    fleetGrantSetBy = rescoped.fleetGrantSetBy ?? undefined;
+    fleetGrantSetAt = rescoped.fleetGrantSetAt ?? undefined;
+    fleetGrantEventId = rescoped.fleetGrantEventId ?? undefined;
   }
 
   return {

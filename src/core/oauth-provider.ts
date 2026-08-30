@@ -29,6 +29,7 @@ import { assertValidSourceId } from './source-id.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes } from './legacy-token-scope.ts';
+import { normalizeFleetGrantSetAt, type RescopedClient } from './oauth-rescope.ts';
 
 /**
  * A slug-prefix write binding is only meaningful if every entry actually
@@ -1333,7 +1334,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       fleetGrantActor?: 'operator' | 'admin-api';
       fleetGrantVia?: 'register_cli' | 'rescope_cli' | 'admin_api';
     },
-  ): Promise<{ clientId: string; clientName: string; sourceId: string; federatedRead: string[]; boundSlugPrefixes?: string[] | null; surface?: string | null; surfaceOld?: string | null; fleetGrant?: 'ordinary_remote' | 'fleet_router'; fleetGrantOld?: 'ordinary_remote' | 'fleet_router'; fleetGrantVersion?: 1; fleetGrantSetBy?: 'operator'; fleetGrantSetAt?: string; fleetGrantEventId?: number }> {
+  ): Promise<RescopedClient> {
     const { sourceId, federatedRead, boundSlugPrefixes, surface, fleetGrant } = opts;
     if (sourceId === undefined && federatedRead === undefined && boundSlugPrefixes === undefined && surface === undefined && fleetGrant === undefined) {
       throw new Error('rescope-client requires --source, --federated-read, --bound-slug-prefixes, --surface, and/or --fleet-grant');
@@ -1412,8 +1413,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
                    fleet_grant_set_at = now()
               FROM prior AS p
              WHERE c.client_id = p.client_id
-             RETURNING c.client_id, c.client_name, c.source_id, c.federated_read,
-                       c.bound_slug_prefixes, c.surface, c.surface_set_by,
+             RETURNING c.client_id, c.client_name, c.scope, c.source_id, c.federated_read, c.bound_slug_prefixes, c.surface, c.surface_set_by,
                        c.fleet_grant, c.fleet_grant_version, c.fleet_grant_set_by, c.fleet_grant_set_at
           ), audited AS (
             INSERT INTO mcp_request_log
@@ -1449,7 +1449,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
                SET source_id = COALESCE(${sourceId ?? null}::text, source_id),
                    federated_read = COALESCE(${federatedRead ? pgArray(federatedRead) : null}::text[], federated_read)
              WHERE client_id = ${clientId}
-             RETURNING client_id, client_name, source_id, federated_read
+             RETURNING client_id, client_name, scope, source_id, federated_read, fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at
           `;
       } else if (boundSlugPrefixes === undefined) {
         rows = await this.sql`
@@ -1459,7 +1459,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
                    surface = ${surface ?? null}::text,
                    surface_set_by = ${surfaceSetBy}::text
              WHERE client_id = ${clientId}
-             RETURNING client_id, client_name, source_id, federated_read, surface, surface_set_by
+             RETURNING client_id, client_name, scope, source_id, federated_read, surface, surface_set_by, fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at
           `;
       } else if (surface === undefined) {
         rows = await this.sql`
@@ -1468,7 +1468,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
                    federated_read = COALESCE(${federatedRead ? pgArray(federatedRead) : null}::text[], federated_read),
                    bound_slug_prefixes = ${boundSlugPrefixes ? pgArray(boundSlugPrefixes) : null}::text[]
              WHERE client_id = ${clientId}
-             RETURNING client_id, client_name, source_id, federated_read, bound_slug_prefixes
+             RETURNING client_id, client_name, scope, source_id, federated_read, bound_slug_prefixes, fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at
           `;
       } else {
         rows = await this.sql`
@@ -1479,7 +1479,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
                    surface = ${surface ?? null}::text,
                    surface_set_by = ${surfaceSetBy}::text
              WHERE client_id = ${clientId}
-             RETURNING client_id, client_name, source_id, federated_read, bound_slug_prefixes, surface, surface_set_by
+             RETURNING client_id, client_name, scope, source_id, federated_read, bound_slug_prefixes, surface, surface_set_by, fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at
           `;
       }
     } catch (err) {
@@ -1507,9 +1507,11 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       throw new Error(`No OAuth client found with id "${clientId}"`);
     }
     const row = rows[0];
+    const fleetGrantSetAt = normalizeFleetGrantSetAt(row.fleet_grant_set_at);
     return {
       clientId: row.client_id as string,
       clientName: (row.client_name as string | null) ?? '',
+      scopes: String(row.scope ?? ''),
       sourceId: (row.source_id as string | null) ?? 'default',
       federatedRead: Array.isArray(row.federated_read) ? (row.federated_read as string[]) : [],
       // undefined = the column wasn't read this call (caller left the
@@ -1521,18 +1523,16 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       ...(surface !== undefined
         ? { surface: (row.surface as string | null) ?? null, surfaceOld: surfaceOld ?? null }
         : {}),
-      ...(fleetGrant !== undefined
-        ? {
-          fleetGrant: row.fleet_grant as 'ordinary_remote' | 'fleet_router',
-          fleetGrantOld: row.fleet_grant_old as 'ordinary_remote' | 'fleet_router',
-          fleetGrantVersion: 1,
-          fleetGrantSetBy: row.fleet_grant_set_by as 'operator',
-          fleetGrantSetAt: row.fleet_grant_set_at instanceof Date
-            ? row.fleet_grant_set_at.toISOString()
-            : new Date(String(row.fleet_grant_set_at)).toISOString(),
-          fleetGrantEventId: Number(row.fleet_grant_event_id),
-        }
-        : {}),
+      fleetGrant: row.fleet_grant as 'ordinary_remote' | 'fleet_router',
+      fleetGrantOld: fleetGrant !== undefined
+        ? row.fleet_grant_old as 'ordinary_remote' | 'fleet_router'
+        : null,
+      fleetGrantVersion: row.fleet_grant_version as 0 | 1,
+      fleetGrantSetBy: row.fleet_grant_set_by === 'operator' ? 'operator' : null,
+      fleetGrantSetAt,
+      fleetGrantEventId: fleetGrant !== undefined
+        ? Number(row.fleet_grant_event_id)
+        : null,
     };
   }
 

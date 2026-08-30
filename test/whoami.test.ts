@@ -103,7 +103,7 @@ describe('whoami op contract', () => {
       { ...base, fleetGrantVersion: undefined },
       { ...base, fleetGrantSetBy: undefined },
       { ...base, fleetGrantSetAt: 'not-a-date' },
-      { ...base, scopes: ['write'] },
+      { ...base, scopes: ['agent'] },
     ]) {
       const denied = await whoami.handler(ctxWith({ remote: true, auth }), {}) as any;
       expect(denied.fleet_router_granted).toBeFalse();

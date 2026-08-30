@@ -1,4 +1,5 @@
 import type { OperationContext } from './contract.ts';
+import { hasScope } from '../scope.ts';
 
 /**
  * Operator-provisioned fleet routers are remote transports but trusted owner
@@ -6,17 +7,19 @@ import type { OperationContext } from './contract.ts';
  * OAuth grants; this predicate never widens that scope.
  */
 export function isFleetRouterContext(ctx: OperationContext): boolean {
+  const auth = ctx.auth;
   return ctx.remote === true
-    && ctx.auth?.scopes.includes('read') === true
+    && auth !== undefined
+    && hasScope(auth.scopes, 'read')
     // F4b owner contract: client_name, surface, and surface_set_by are
     // classification/presentation metadata, never authorization. All three
     // dedicated row fields must survive token projection; a legacy or
     // degraded projection therefore fails closed.
-    && ctx.auth.fleetGrant === 'fleet_router'
-    && ctx.auth.fleetGrantVersion === 1
-    && ctx.auth.fleetGrantSetBy === 'operator'
-    && typeof ctx.auth.fleetGrantSetAt === 'string'
-    && Number.isFinite(Date.parse(ctx.auth.fleetGrantSetAt));
+    && auth.fleetGrant === 'fleet_router'
+    && auth.fleetGrantVersion === 1
+    && auth.fleetGrantSetBy === 'operator'
+    && typeof auth.fleetGrantSetAt === 'string'
+    && Number.isFinite(Date.parse(auth.fleetGrantSetAt));
 }
 
 /** Capture/session provenance is private metadata even for a world fact. */

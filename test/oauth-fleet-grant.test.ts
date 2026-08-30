@@ -175,14 +175,15 @@ describe('dedicated fleet-router OAuth grant (v143)', () => {
     });
   });
 
-  test('predicate fails closed for missing proof, no read scope, local ambiguity, and degraded projection', () => {
+  test('predicate honors the scope hierarchy and fails closed for missing proof or degraded projection', () => {
     const proof = {
       fleetGrant: 'fleet_router' as const,
       fleetGrantVersion: 1 as const,
       fleetGrantSetBy: 'operator' as const,
       fleetGrantSetAt: '2026-08-29T12:00:00.000Z',
     };
-    expect(isFleetRouterContext(context({ ...proof, scopes: ['write'] }))).toBeFalse();
+    expect(isFleetRouterContext(context({ ...proof, scopes: ['write'] }))).toBeTrue();
+    expect(isFleetRouterContext(context({ ...proof, scopes: ['agent'] }))).toBeFalse();
     expect(isFleetRouterContext({ ...context(proof), remote: undefined } as unknown as OperationContext)).toBeFalse();
     expect(isFleetRouterContext(context({ ...proof, fleetGrantSetBy: undefined }))).toBeFalse();
     expect(isFleetRouterContext(context({ ...proof, fleetGrantSetAt: undefined }))).toBeFalse();
