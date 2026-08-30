@@ -22,11 +22,13 @@ import type { WriterLintPayload } from '../output/post-write.ts';
 import { stripFactsFence } from '../facts-fence.ts';
 import { getContentFlag } from '../quarantine.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
+import { factPageBindingsFor, loadFactPageBindings } from '../facts/page-bindings.ts';
 import { isValidSourceId, ALL_SOURCES } from '../source-id.ts';
 import { resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs } from '../search/private-visibility.ts';
 import { LIST_PAGES_DESCRIPTION, CAPTURE_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
+import { canReadFactBindings } from './fleet-router-context.ts';
 import {
   enforceSubagentSlugFence,
   slugOutsideCallerFence,
@@ -236,6 +238,12 @@ const get_page: Operation = {
     // it" signal it would get from search. The marker is also in frontmatter;
     // this is the clean, documented accessor.
     const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
+    const bindingMap = await loadFactPageBindings(
+      ctx.engine,
+      [{ sourceId: page.source_id, slug: page.slug }],
+      { authorized: canReadFactBindings(ctx) },
+    );
+    const fact_bindings = factPageBindingsFor(bindingMap, page.source_id, page.slug);
     // #2225: `content` is the canonical serialized markdown (frontmatter +
     // compiled_truth + `<!-- timeline -->` sentinel + timeline). Clients that
     // edit-and-put_page this field round-trip losslessly; hand-concatenating
@@ -251,6 +259,7 @@ const get_page: Operation = {
       ...(includeContent ? { content: serializePageToMarkdown(visibleBody as Page, tags) } : {}),
       ...(resolved_slug ? { resolved_slug } : {}),
       ...(content_flag ? { content_flag } : {}),
+      ...(fact_bindings.length ? { fact_bindings } : {}),
     };
   },
   scope: 'read',
@@ -678,6 +687,7 @@ const put_page: Operation = {
           engine: ctx.engine,
           sourceId: ctx.sourceId ?? 'default',
           sessionId: (ctx as { source_session?: string }).source_session ?? null,
+          sourceSlug: slug,
           source: 'mcp:put_page',
           mode: 'queue',
         },

@@ -111,6 +111,21 @@ interface ParsedPageInput {
   frontmatter: Record<string, unknown>;
 }
 
+/** Recover lineage for both current and pre-sourceSlug durable job payloads. */
+export function factsAbsorbReplayLineage(
+  page: { slug: string },
+  data: Record<string, unknown>,
+): Pick<FactsBackstopCtx, 'sessionId' | 'sourceSlug'> {
+  return {
+    sessionId: typeof data.sessionId === 'string' && data.sessionId.trim()
+      ? data.sessionId
+      : null,
+    sourceSlug: typeof data.sourceSlug === 'string' && data.sourceSlug.trim()
+      ? data.sourceSlug
+      : page.slug,
+  };
+}
+
 /**
  * Cosine similarity threshold for the dedup fast-path. Matches the existing
  * extract_facts op behavior at operations.ts:2460. Higher = stricter
@@ -236,6 +251,21 @@ export async function runFactsBackstop(
   ctx: FactsBackstopCtx,
 ): Promise<FactsBackstopResult> {
   const mode = ctx.mode ?? 'queue';
+  const frontmatterSession = parsedPage.frontmatter.hermes_session_ref;
+  // The capture page and Hermes session are origin provenance. Keep them
+  // separate from source_markdown_slug, which remains the physical entity
+  // fence coordinate used by markdown-first reconciliation.
+  ctx = {
+    ...ctx,
+    sourceSlug: typeof ctx.sourceSlug === 'string' && ctx.sourceSlug.trim()
+      ? ctx.sourceSlug.trim()
+      : parsedPage.slug,
+    sessionId: typeof ctx.sessionId === 'string' && ctx.sessionId.trim()
+      ? ctx.sessionId.trim()
+      : typeof frontmatterSession === 'string' && frontmatterSession.trim()
+        ? frontmatterSession.trim()
+        : null,
+  };
 
   // --- Eligibility + kill-switch gates (run before any LLM cost) ---
   const { isFactsExtractionEnabled } = await import('./extract.ts');
@@ -301,6 +331,13 @@ export async function runFactsBackstop(
           .update(parsedPage.compiled_truth)
           .digest('hex')
           .slice(0, 16);
+        // Lineage is part of the durable job's result identity. Hash the
+        // normalized values so an identical body arriving from a different
+        // capture page/session cannot coalesce onto stale job data, without
+        // adding the new lineage fields to the queue key in plaintext.
+        const lineageHash = createHash('sha256')
+          .update(JSON.stringify([ctx.sourceSlug, ctx.sessionId]))
+          .digest('hex');
         const minions = new MinionQueue(ctx.engine);
         // [ENG-8] Caller-unset visibility resolves the brain default HERE
         // (not in the long-lived worker) so the durable payload carries the
@@ -313,15 +350,17 @@ export async function runFactsBackstop(
             sourceId: ctx.sourceId,
             source: ctx.source,
             sessionId: ctx.sessionId,
+            sourceSlug: ctx.sourceSlug,
             notabilityFilter: ctx.notabilityFilter ?? 'all',
             visibility: ctx.visibility ?? (await resolveDefaultVisibility(ctx.engine)),
             ...(ctx.model ? { model: ctx.model } : {}),
           },
           {
             queue: 'default',
-            // Content-hash key: re-submits after edits, dedups rapid
-            // identical writes (idempotent ON CONFLICT returns existing row).
-            idempotency_key: `facts-absorb:${ctx.sourceId}:${parsedPage.slug}:${contentHash}`,
+            // Content + normalized-lineage key: exact retries dedup, while
+            // changed capture provenance always receives fresh job data.
+            idempotency_key:
+              `facts-absorb:${ctx.sourceId}:${parsedPage.slug}:${contentHash}:${lineageHash}`,
             // 5 attempts at a 60s exponential base (not the 3×1s default):
             // execution-time chat_unavailable is config drift the operator
             // fixes on a human timescale — 3 attempts in ~seconds would

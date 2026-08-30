@@ -25,6 +25,7 @@ const row: SearchResult = {
 function context(
   remote: boolean,
   clientName?: string,
+  surfaceSetBy?: string,
 ): { ctx: OperationContext; calls: SearchOpts[] } {
   const calls: SearchOpts[] = [];
   const engine = {
@@ -46,6 +47,16 @@ function context(
       if (sql.startsWith('SELECT id, updated_at FROM pages')) {
         return [{ id: 7, updated_at: new Date('2026-08-28T12:34:56.000Z') }];
       }
+      if (sql.includes('WITH refs(source_id, slug)')) {
+        return [{
+          ref_source_id: 'source-a',
+          ref_slug: row.slug,
+          fact_id: 77,
+          capture_page_slug: 'daily/hermes/owner-a/0123456789abcdef0123/turn-a',
+          hermes_session_ref: '0123456789abcdef0123',
+          matched_via: 'entity_fence',
+        }];
+      }
       return [];
     },
   };
@@ -64,6 +75,7 @@ function context(
           clientId: 'fixture-client',
           clientName,
           scopes: ['read'],
+          ...(surfaceSetBy ? { surfaceSetBy } : {}),
         },
       } : {}),
     } as unknown as OperationContext,
@@ -110,8 +122,16 @@ describe('search source_ids trusted-local contract', () => {
   test('accepts vectors locally and from the exact fleet-router OAuth identity', () => {
     const vector = [0.1, 0.2, 0.3];
     expect(normalizeTrustedQueryEmbedding(context(false).ctx, vector)).toHaveLength(3);
-    expect(normalizeTrustedQueryEmbedding(
+    expect(() => normalizeTrustedQueryEmbedding(
       context(true, 'brain-router-imekka-0123456789ab').ctx,
+      vector,
+    )).toThrow();
+    expect(() => normalizeTrustedQueryEmbedding(
+      context(true, 'brain-router-imekka-0123456789ab', 'dcr_default').ctx,
+      vector,
+    )).toThrow();
+    expect(normalizeTrustedQueryEmbedding(
+      context(true, 'brain-router-imekka-0123456789ab', 'operator').ctx,
       vector,
     )).toHaveLength(3);
   });
@@ -125,7 +145,7 @@ describe('search source_ids trusted-local contract', () => {
   });
 
   test('fleet router quality mode keeps reranking enabled with a 25-row-or-larger pool', async () => {
-    const { ctx } = context(true, 'brain-router-imekka-0123456789ab');
+    const { ctx } = context(true, 'brain-router-imekka-0123456789ab', 'operator');
     const mode = resolveSearchModeForCaller(ctx, 'balanced');
     const reranker = await resolvePrecomputedQueryReranker(ctx, mode, 10);
 
@@ -136,7 +156,7 @@ describe('search source_ids trusted-local contract', () => {
   });
 
   test('fleet router rejects conservative mode while ordinary remote mode stays ignored', () => {
-    const fleet = context(true, 'brain-router-imekka-0123456789ab').ctx;
+    const fleet = context(true, 'brain-router-imekka-0123456789ab', 'operator').ctx;
     const ordinary = context(true, 'ordinary-client').ctx;
 
     expect(() => resolveSearchModeForCaller(fleet, 'conservative')).toThrow();
@@ -153,12 +173,49 @@ describe('search source_ids trusted-local contract', () => {
   });
 
   test('fleet router may request the bounded keyword fallback', () => {
-    const { ctx } = context(true, 'brain-router-imekka-0123456789ab');
+    const { ctx } = context(true, 'brain-router-imekka-0123456789ab', 'operator');
     expect(normalizeFleetRouterKeywordFallback(ctx, true)).toBe(true);
   });
 
   test('ordinary remote clients cannot request the keyword fallback', () => {
     const { ctx } = context(true, 'ordinary-client');
     expect(() => normalizeFleetRouterKeywordFallback(ctx, true)).toThrow();
+  });
+
+  test('self-named DCR clients cannot request fleet-router controls', async () => {
+    const { ctx } = context(
+      true,
+      'brain-router-imekka-0123456789ab',
+      'dcr_default',
+    );
+    expect(() => normalizeFleetRouterKeywordFallback(ctx, true)).toThrow();
+    expect(resolveSearchModeForCaller(ctx, 'balanced')).toBeUndefined();
+    const reranker = await resolvePrecomputedQueryReranker(ctx, undefined, 10);
+    expect(reranker.enabled).toBe(false);
+    expect(reranker.topNIn).toBe(10);
+  });
+
+  test('search emits private capture bindings only for the authenticated fleet router', async () => {
+    const fleet = context(true, 'brain-router-owner-0123456789ab', 'operator');
+    const fleetResults = await operationsByName.search.handler(fleet.ctx, {
+      query: 'fixture',
+    }) as SearchResult[];
+    expect((fleetResults[0] as SearchResult & { fact_bindings?: unknown[] }).fact_bindings).toHaveLength(1);
+
+    const ordinary = context(true, 'ordinary-client');
+    const ordinaryResults = await operationsByName.search.handler(ordinary.ctx, {
+      query: 'fixture',
+    }) as SearchResult[];
+    expect((ordinaryResults[0] as SearchResult & { fact_bindings?: unknown[] }).fact_bindings).toBeUndefined();
+
+    const selfNamedDcr = context(
+      true,
+      'brain-router-owner-0123456789ab',
+      'dcr_default',
+    );
+    const dcrResults = await operationsByName.search.handler(selfNamedDcr.ctx, {
+      query: 'fixture',
+    }) as SearchResult[];
+    expect((dcrResults[0] as SearchResult & { fact_bindings?: unknown[] }).fact_bindings).toBeUndefined();
   });
 });
