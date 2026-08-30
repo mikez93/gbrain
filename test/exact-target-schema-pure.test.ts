@@ -189,7 +189,10 @@ function expectReason(
   if (result.ok) throw new Error(`expected rejection ${reason}`);
   expect(result.reason_code).toBe(reason);
   expect(result.reason_family).toBe(EXACT_TARGET_SCHEMA_REASON_FAMILIES[reason]);
-  expect(result.consumption_state).toBe(previousState);
+  expect(result.consumption_state).toEqual(previousState);
+  expect(result.consumption_state).not.toBe(previousState);
+  expect(Object.isFrozen(result)).toBe(true);
+  expect(Object.isFrozen(result.consumption_state)).toBe(true);
 }
 
 function replaceRow(
@@ -589,6 +592,63 @@ describe('exact-target pure schema and attestation validator', () => {
       input({ now: new Date('2026-08-30T00:01:00Z') as unknown as string }),
       'SCHEMA_ATTESTATION_TIMESTAMP_REJECTED',
     );
+  });
+
+  test('rejects canonical-looking impossible dates and accepts a real leap day', () => {
+    expectReason(
+      input({ now: '2026-02-31T00:01:00.000000Z' }),
+      'SCHEMA_ATTESTATION_TIMESTAMP_REJECTED',
+    );
+    const leapAttestation = {
+      ...ATTESTATION,
+      acquired_at: '2028-02-29T00:00:00.000000Z',
+      expires_at: '2028-02-29T00:05:00.000000Z',
+    };
+    expect(
+      validate(
+        input({
+          attestation: leapAttestation,
+          now: '2028-02-29T00:01:00.000000Z',
+        }),
+      ).ok,
+    ).toBe(true);
+  });
+
+  test('returns a stable frozen state rejection for null and undefined input', () => {
+    for (const invalidInput of [null, undefined]) {
+      const result = validateExactTargetSchema(invalidInput);
+      expect(result).toEqual({
+        ok: false,
+        reason_code: 'SCHEMA_ATTESTATION_STATE_REJECTED',
+        reason_family: 'SCHEMA_ATTESTATION_FRESHNESS_REJECTED',
+        consumption_state: null,
+      });
+      expect(Object.isFrozen(result)).toBe(true);
+      assertEffectsZero();
+    }
+  });
+
+  test('deep-freezes copy-safe accepted decisions and normalized rows', () => {
+    const candidate = input();
+    const result = validate(candidate);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason_code);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.isFrozen(result.normalized_rows)).toBe(true);
+    expect(result.normalized_rows.every((row) => Object.isFrozen(row))).toBe(true);
+    expect(Object.isFrozen(result.consumption_state)).toBe(true);
+
+    const firstName = result.normalized_rows[0]!.column_name;
+    const callerRow = candidate.rows.find((row) => row.column_name === firstName)!;
+    (callerRow as { data_type: string }).data_type = 'text';
+    expect(result.normalized_rows[0]!.data_type).toBe('integer');
+    expect(() => {
+      (result.normalized_rows[0] as { data_type: string }).data_type = 'text';
+    }).toThrow();
+    expect(() => {
+      (result as { schema_sha256: string }).schema_sha256 = '0'.repeat(64);
+    }).toThrow();
+    expect(result.schema_sha256).toBe(DIGEST);
   });
 
   test('rejects a threaded consumed state without mutating it', () => {

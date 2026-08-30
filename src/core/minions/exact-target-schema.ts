@@ -157,7 +157,7 @@ export interface ExactTargetSchemaRejected {
   readonly ok: false;
   readonly reason_code: ExactTargetSchemaReason;
   readonly reason_family: ExactTargetSchemaReasonFamily;
-  readonly consumption_state: ExactTargetAttestationConsumptionState;
+  readonly consumption_state: ExactTargetAttestationConsumptionState | null;
 }
 
 export interface ExactTargetSchemaAccepted {
@@ -230,21 +230,45 @@ function exactKeys(value: object, expected: readonly string[]): boolean {
 
 function reject(
   reason_code: ExactTargetSchemaReason,
-  consumption_state: ExactTargetAttestationConsumptionState,
+  consumption_state: ExactTargetAttestationConsumptionState | null,
 ): ExactTargetSchemaRejected {
-  return {
+  const stateSnapshot =
+    consumption_state === null
+      ? null
+      : Object.freeze({ ...consumption_state });
+  return Object.freeze({
     ok: false,
     reason_code,
     reason_family: EXACT_TARGET_SCHEMA_REASON_FAMILIES[reason_code],
-    consumption_state,
-  };
+    consumption_state: stateSnapshot,
+  });
 }
 
 function validCanonicalTimestamp(value: unknown): value is string {
-  if (typeof value !== 'string' || !UTC_SIX_MICROSECONDS.test(value)) {
+  if (typeof value !== 'string') {
     return false;
   }
-  return !Number.isNaN(Date.parse(value));
+  const match = UTC_SIX_MICROSECONDS.exec(value);
+  if (match === null) return false;
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ];
+  return year >= 1 && day >= 1 && day <= daysInMonth[month - 1]!;
 }
 
 function compareColumnName(
@@ -285,12 +309,13 @@ export function validateExactTargetDigestEquality(
 }
 
 export function validateExactTargetSchema(
-  input: ValidateExactTargetSchemaInput,
+  input: ValidateExactTargetSchemaInput | null | undefined,
 ): ExactTargetSchemaValidationResult {
+  if (!input || typeof input !== 'object') {
+    return reject('SCHEMA_ATTESTATION_STATE_REJECTED', null);
+  }
   const state = input.consumption_state;
   if (
-    !input ||
-    typeof input !== 'object' ||
     !Array.isArray(input.rows) ||
     !state ||
     typeof state !== 'object' ||
@@ -421,13 +446,16 @@ export function validateExactTargetSchema(
   );
   if (digestReason !== null) return reject(digestReason, state);
 
-  return {
+  const acceptedRows = Object.freeze(
+    normalized.map((row) => Object.freeze({ ...row })),
+  );
+  return Object.freeze({
     ok: true,
-    normalized_rows: Object.freeze(normalized),
+    normalized_rows: acceptedRows,
     serialization,
     serialized_bytes: EXACT_TARGET_SCHEMA_SERIALIZED_BYTES,
     schema_sha256: EXACT_TARGET_SCHEMA_DIGEST,
     consumption_state: Object.freeze({ key: state.key, status: 'consumed' }),
     scope_limit: EXACT_TARGET_ATTESTATION_SCOPE_LIMIT,
-  };
+  });
 }
