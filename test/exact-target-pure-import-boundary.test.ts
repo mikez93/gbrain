@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import './exact-target-pure-effect-tripwire.test.ts';
 import {
   EXACT_TARGET_APPROVED_LOCK_DURATION_MS,
@@ -17,6 +17,10 @@ const ROOTS = [
 
 function text(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes);
+}
+
+function sha256(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
 }
 
 function run(command: readonly string[]) {
@@ -137,30 +141,74 @@ describe('exact-target pure import boundary', () => {
       'exact-target-orders-0-2-v2',
       '--json',
     ];
-    const result = run(command);
-    expect(result.exitCode, result.stderr).toBe(0);
-    const receipt = JSON.parse(result.stdout);
-    expect(receipt.forbidden_match_count).toBe(0);
-    expect(receipt.resolved_transitive_modules).toEqual([...ROOTS].sort());
-    expect(receipt.edge_count).toBe(1);
-    expect(receipt.graph_sha256).toHaveLength(64);
+    const results = [run(command), run(command)];
+    for (const result of results) {
+      expect(result.exitCode, result.stderr).toBe(0);
+    }
+    const receipts = results.map((result) => JSON.parse(result.stdout));
+    expect(receipts[0].forbidden_match_count).toBe(0);
+    expect(receipts[0].resolved_transitive_modules).toEqual([...ROOTS].sort());
+    expect(receipts[0].edge_count).toBe(1);
+    expect(receipts[0].graph_sha256).toHaveLength(64);
+    expect(receipts[1].graph_sha256).toBe(receipts[0].graph_sha256);
+    expect(receipts[1].module_sha256).toEqual(receipts[0].module_sha256);
   });
 
   test('publishes an exclusive owner-only bound receipt', () => {
     const result = run(guardCommand());
     expect(result.exitCode, result.stderr).toBe(0);
     const summary = JSON.parse(result.stdout);
-    const runDirectory = join('/tmp', summary.run_directory_basename);
+    const runDirectory = lstatSync(summary.run_directory_path);
+    const receiptInfo = lstatSync(summary.receipt_path);
+    const receiptBytes = readFileSync(summary.receipt_path);
+    const receipt = JSON.parse(receiptBytes.toString());
     expect(summary.pass).toBe(true);
     expect(summary.roots).toBe(2);
     expect(summary.receipt_mode).toBe('0600');
     expect(summary.run_directory_mode).toBe('0700');
     expect(summary.receipt_sha256).toHaveLength(64);
-    // The platform temp parent may not literally be /tmp; inode/mode fields are
-    // authoritative and the runner has already compared named/open descriptors.
+    expect(summary.graph_repeat_runs).toBe(2);
+    expect(summary.graph_repeat_identical).toBe(true);
+    expect(runDirectory.isDirectory()).toBe(true);
+    expect(runDirectory.mode & 0o777).toBe(0o700);
+    expect(receiptInfo.isFile()).toBe(true);
+    expect(receiptInfo.isSymbolicLink()).toBe(false);
+    expect(receiptInfo.mode & 0o777).toBe(0o600);
+    expect(receiptInfo.nlink).toBe(1);
+    expect(sha256(receiptBytes)).toBe(summary.receipt_sha256);
+    expect(receipt.source.commit).toBe(summary.source_commit);
+    expect(receipt.source.tree).toBe(summary.source_tree);
+    expect(receipt.graph_repeat).toEqual({
+      runs: 2,
+      identical: true,
+      graph_sha256: summary.graph_sha256,
+    });
     expect(summary.receipt_ino).toBeGreaterThan(0);
     expect(summary.run_directory_ino).toBeGreaterThan(0);
-    expect(typeof runDirectory).toBe('string');
+    expect(summary.receipt_path.startsWith(summary.run_directory_path)).toBe(true);
+  });
+
+  test('fails closed on all eight receipt integrity mutations', () => {
+    const result = run([
+      '/usr/bin/python3',
+      'scripts/run-exact-target-pure-import-guard.py',
+      '--self-test-receipt-safety',
+    ]);
+    expect(result.exitCode, result.stderr).toBe(0);
+    const receipt = JSON.parse(result.stdout);
+    expect(receipt.pass).toBe(true);
+    expect(receipt.case_count).toBe(8);
+    expect(receipt.cases.map((entry: { name: string }) => entry.name)).toEqual([
+      'precreated_receipt_regular_file',
+      'receipt_symlink',
+      'receipt_hardlink_nlink_gt_one',
+      'stale_prior_receipt',
+      'precreated_run_directory_name_collision',
+      'unsafe_run_directory_mode_or_owner',
+      'named_opened_inode_swap',
+      'two_concurrent_runs_distinct_dirs_receipts_challenges_bindings',
+    ]);
+    for (const entry of receipt.cases) expect(entry.pass).toBe(true);
   });
 
   test('rejects a synthetic forbidden import without evaluating it', () => {

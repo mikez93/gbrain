@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { EXACT_TARGET_FORBIDDEN_CASES } from './fixtures/exact-target-forbidden-effects/cases.ts';
-import { runRejectedEffectTripwire } from './helpers/exact-target-effect-tripwire.ts';
+import {
+  createGuardedExecutorSpy,
+  runRejectedEffectTripwire,
+} from './helpers/exact-target-effect-tripwire.ts';
 
 describe('exact-target effect tripwire', () => {
   test('rejects all 30 evasive fixtures before any effect', () => {
@@ -8,6 +11,8 @@ describe('exact-target effect tripwire', () => {
       EXACT_TARGET_FORBIDDEN_CASES.map((fixture) => fixture.source),
     );
     expect(result.exitCode).toBe(0);
+    expect(result.rejectionCount).toBe(30);
+    expect(result.executorInvocationCount).toBe(0);
     expect(result.effectCount).toBe(0);
     expect(result.scans).toHaveLength(30);
     for (const [index, fixture] of EXACT_TARGET_FORBIDDEN_CASES.entries()) {
@@ -16,5 +21,14 @@ describe('exact-target effect tripwire', () => {
       expect(scan?.violations.length).toBeGreaterThan(0);
       expect(fixture.id.length).toBeGreaterThan(0);
     }
+  });
+
+  test('guarded executor counts a missed rejection without evaluating source', () => {
+    const executor = createGuardedExecutorSpy();
+    expect(() => executor.execute('Bun.write("danger", "data")', 'probe')).toThrow(
+      'forbidden fixture reached guarded executor',
+    );
+    expect(executor.invocationCount).toBe(1);
+    expect(executor.effectCount).toBe(1);
   });
 });
