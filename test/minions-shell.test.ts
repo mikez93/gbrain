@@ -49,6 +49,8 @@ function makeCtx(
   return {
     id: 1,
     name: 'shell',
+    queue: 'default',
+    idempotency_key: null,
     data,
     attempts_made: 0,
     signal: opts.signal ?? new AbortController().signal,

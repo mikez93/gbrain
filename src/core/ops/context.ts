@@ -512,7 +512,7 @@ export function resolveRequestedScope(
     if (ctx.remote !== false && allowed && allowed.length > 0 && !allowed.includes(sourceIdParam)) {
       throw new OperationError(
         'permission_denied',
-        `source '${sourceIdParam}' is outside your granted sources`,
+        'Requested source is outside your granted sources.',
         'Request access to this source, or omit source_id to search within your grant.',
       );
     }

@@ -263,6 +263,9 @@ export interface MinionWorkerOpts {
 export interface MinionJobContext {
   id: number;
   name: string;
+  /** Durable queue and dedup identity from the claimed row. */
+  queue: string;
+  idempotency_key: string | null;
   data: Record<string, unknown>;
   attempts_made: number;
   /** AbortSignal for cooperative cancellation (fires on timeout, cancel, pause, or lock loss). */

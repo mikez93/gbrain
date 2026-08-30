@@ -56,6 +56,8 @@ function makeJob(data: Record<string, unknown>): MinionJobContext {
   return {
     id: 1,
     name: 'ingest_capture',
+    queue: 'default',
+    idempotency_key: null,
     data,
     attempts_made: 1,
     signal: new AbortController().signal,

@@ -23,6 +23,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
@@ -57,6 +58,12 @@ beforeEach(async () => {
     type: 'person',
     title: 'Alice (beta)',
     compiled_truth: 'Beta-source Alice page.',
+    frontmatter: { type: 'person' },
+  }, { sourceId: 'beta' });
+  await engine.putPage('people/beth-private-to-beta', {
+    type: 'person',
+    title: 'Beth Beta Only',
+    compiled_truth: 'This candidate exists only in beta.',
     frontmatter: { type: 'person' },
   }, { sourceId: 'beta' });
 });
@@ -112,5 +119,51 @@ describe('#1436 — resolveSlugs honors source scope', () => {
     expect(alpha).toEqual([]);
     const beta = await engine.resolveSlugs('people/alice', { sourceId: 'beta' });
     expect(beta).toEqual(['people/alice']);
+  });
+
+  test('fleet grant cannot reveal an out-of-source exact or fuzzy candidate or query bindings', async () => {
+    const ctx = {
+      engine,
+      config: {},
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'alpha',
+      auth: {
+        token: 'fixture',
+        clientId: 'fleet-alpha',
+        clientName: 'any-name',
+        scopes: ['read'],
+        sourceId: 'alpha',
+        allowedSources: ['alpha'],
+        fleetGrant: 'fleet_router',
+        fleetGrantVersion: 1,
+        fleetGrantSetBy: 'operator',
+        fleetGrantSetAt: '2026-08-29T12:00:00.000Z',
+      },
+    } as unknown as OperationContext;
+    const originalExecuteRaw = engine.executeRaw.bind(engine);
+    let bindingSqlCalls = 0;
+    engine.executeRaw = (async (sql: string, params?: unknown[]) => {
+      if (sql.includes('WITH refs(source_id, slug)')) bindingSqlCalls += 1;
+      return originalExecuteRaw(sql, params);
+    }) as typeof engine.executeRaw;
+    try {
+      for (const slug of ['people/beth-private-to-beta', 'people/beth-private-to-bet']) {
+        let failure: unknown;
+        try {
+          await operationsByName.get_page.handler(ctx, { slug });
+        } catch (error) {
+          failure = error;
+        }
+        expect(failure).toMatchObject({ code: 'page_not_found' });
+        if (slug.endsWith('-bet')) {
+          expect(JSON.stringify(failure)).not.toContain('beth-private-to-beta');
+        }
+      }
+      expect(bindingSqlCalls).toBe(0);
+    } finally {
+      engine.executeRaw = originalExecuteRaw as typeof engine.executeRaw;
+    }
   });
 });

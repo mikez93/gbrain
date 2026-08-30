@@ -675,6 +675,30 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   -- tier names into surface); NULL = server/config surface resolution.
   surface                 TEXT NULL,
   surface_set_by          TEXT NULL,
+  -- v143: dedicated operator-only authorization for the fleet router's
+  -- private capture-lineage read path. Client names and tool-surface
+  -- metadata are deliberately not authorization signals.
+  fleet_grant             TEXT NOT NULL DEFAULT 'ordinary_remote',
+  fleet_grant_version     INTEGER NOT NULL DEFAULT 0,
+  fleet_grant_set_by      TEXT NULL,
+  fleet_grant_set_at      TIMESTAMPTZ NULL,
+  CONSTRAINT oauth_clients_fleet_grant_state_chk
+    CHECK (fleet_grant IN ('ordinary_remote', 'fleet_router')),
+  CONSTRAINT oauth_clients_fleet_grant_version_chk
+    CHECK (fleet_grant_version IN (0, 1)),
+  CONSTRAINT oauth_clients_fleet_grant_proof_chk
+    CHECK (
+      (fleet_grant_version = 0 AND fleet_grant = 'ordinary_remote'
+        AND fleet_grant_set_by IS NULL AND fleet_grant_set_at IS NULL)
+      OR (fleet_grant_version = 1
+        AND fleet_grant_set_by = 'operator' AND fleet_grant_set_at IS NOT NULL)
+    ),
+  CONSTRAINT oauth_clients_fleet_grant_active_chk
+    CHECK (
+      fleet_grant <> 'fleet_router'
+      OR (fleet_grant_version = 1
+        AND fleet_grant_set_by = 'operator' AND fleet_grant_set_at IS NOT NULL)
+    ),
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the write-source scope;

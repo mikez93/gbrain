@@ -33,6 +33,8 @@ function confidential(): RegisteredClient {
     redirectUris: [],
     sourceId: 'default',
     federatedRead: ['default'],
+    fleetGrant: 'ordinary_remote',
+    fleetGrantVersion: 0,
     created: { source: false },
   };
 }
@@ -50,10 +52,25 @@ describe('auth register-client output pin (byte-identical product contract)', ()
       '  Token auth method:   client_secret_post',
       '  Write source:        default',
       '  Federated reads:     default',
+      '  Fleet router grant:  ordinary_remote',
       '',
       'Save the client secret — it will not be shown again.',
       'Revoke with: gbrain auth revoke-client "gbrain_cl_abc123"',
     ]);
+  });
+
+  test('fleet-router registration prints only content-free grant state and event id', () => {
+    const parsed = parseRegisterClientArgs(['--fleet-router']);
+    const lines = formatRegisterClientOutput('fleet', {
+      ...confidential(),
+      fleetGrant: 'fleet_router',
+      fleetGrantVersion: 1,
+      fleetGrantSetBy: 'operator',
+      fleetGrantSetAt: '2026-08-29T12:00:00.000Z',
+      fleetGrantEventId: 42,
+    }, parsed);
+    expect(lines).toContain('  Fleet router grant:  fleet_router (v1; event 42)');
+    expect(lines.join('\n')).not.toContain('2026-08-29T12:00:00.000Z');
   });
 
   test('connect.ts production scraping regexes match the joined output', () => {

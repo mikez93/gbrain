@@ -77,7 +77,37 @@ describe('whoami op contract', () => {
       expires_at: 1234567890,
       source_id: 'hot-memory',
       federated_read: ['hot-memory', 'canonical-brain'],
+      fleet_router_granted: false,
+      fleet_grant_version: null,
     });
+  });
+
+  test('oauth transport reports only a complete nondegraded fleet grant as active', async () => {
+    const base: AuthInfo = {
+      token: 'gbrain_at_fleet',
+      clientId: 'gbrain_cl_fleet',
+      scopes: ['read'],
+      sourceId: 'default',
+      allowedSources: ['default'],
+      fleetGrant: 'fleet_router',
+      fleetGrantVersion: 1,
+      fleetGrantSetBy: 'operator',
+      fleetGrantSetAt: '2026-08-29T12:00:00.000Z',
+    };
+    const granted = await whoami.handler(ctxWith({ remote: true, auth: base }), {}) as any;
+    expect(granted.fleet_router_granted).toBeTrue();
+    expect(granted.fleet_grant_version).toBe(1);
+
+    for (const auth of [
+      { ...base, fleetGrant: 'ordinary_remote' as const },
+      { ...base, fleetGrantVersion: undefined },
+      { ...base, fleetGrantSetBy: undefined },
+      { ...base, fleetGrantSetAt: 'not-a-date' },
+      { ...base, scopes: ['write'] },
+    ]) {
+      const denied = await whoami.handler(ctxWith({ remote: true, auth }), {}) as any;
+      expect(denied.fleet_router_granted).toBeFalse();
+    }
   });
 
   test('oauth transport uses fail-closed empty values when source grants are absent', async () => {
@@ -92,6 +122,8 @@ describe('whoami op contract', () => {
     )) as any;
     expect(result.source_id).toBeNull();
     expect(result.federated_read).toEqual([]);
+    expect(result.fleet_router_granted).toBeFalse();
+    expect(result.fleet_grant_version).toBeNull();
   });
 
   test('oauth transport preserves an explicit empty federated grant', async () => {
@@ -205,6 +237,8 @@ describe('whoami op metadata', () => {
   test('description documents OAuth source grant fields', () => {
     expect(whoami.description).toContain('source_id');
     expect(whoami.description).toContain('federated_read');
+    expect(whoami.description).toContain('fleet_router_granted');
+    expect(whoami.description).toContain('fleet_grant_version');
   });
 
   test('scope is read (any authenticated caller can introspect itself)', () => {

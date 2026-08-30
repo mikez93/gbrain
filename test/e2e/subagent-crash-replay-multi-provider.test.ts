@@ -276,6 +276,8 @@ async function makeCrashedCtx(jobId: number, prompt: string, modelId: string): P
   return {
     id: jobId,
     name: 'subagent',
+    queue: 'default',
+    idempotency_key: null,
     data: { prompt, model: modelId },
     attempts_made: 1, // crashed once
     signal: abortCtrl.signal,

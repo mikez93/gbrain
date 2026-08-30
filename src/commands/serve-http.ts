@@ -1891,9 +1891,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       //     and other malformed inputs
       // normalizeScopesInput handles all four valid shapes (string, string[],
       // missing, empty) and rejects the rest with a structured 400.
-      const { name, source, federatedRead, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
+      const { name, source, federatedRead, fleetRouter, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
       const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (fleetRouter !== undefined && typeof fleetRouter !== 'boolean') {
+        res.status(400).json({ error: 'fleetRouter must be a boolean' });
+        return;
+      }
       let scopeString: string;
       try {
         scopeString = normalizeScopesInput(rawScopes);
@@ -2039,7 +2043,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           boundMaxConcurrent: undefined,
           budgetUsdPerDay: undefined,
           tokenTtlSeconds: undefined,
-        }, { tokenTtlSeconds: ttlNum, columns });
+          fleetRouter: fleetRouter === true,
+        }, {
+          tokenTtlSeconds: ttlNum,
+          columns,
+          fleetGrantActor: 'admin-api',
+          fleetGrantVia: 'admin_api',
+        });
       });
       if (dupClientId !== null) {
         res.status(409).json({
@@ -2056,6 +2066,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         clientId: reg.clientId,
         ...(reg.clientSecret !== undefined ? { clientSecret: reg.clientSecret } : {}),
         tokenTtl: reg.tokenTtl ?? null,
+        fleetGrant: reg.fleetGrant,
+        fleetGrantVersion: reg.fleetGrantVersion,
+        fleetGrantEventId: reg.fleetGrantEventId ?? null,
       });
     } catch (e) {
       // A throw INSIDE the tx rolls the row back (no client persists); the
@@ -2088,7 +2101,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // validator inside rescopeClient.
   app.post('/admin/api/rescope-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
     try {
-      const { clientId, sourceId, federatedRead, boundSlugPrefixes, surface } = req.body ?? {};
+      const { clientId, sourceId, federatedRead, boundSlugPrefixes, surface, fleetGrant } = req.body ?? {};
       if (!clientId || typeof clientId !== 'string') {
         res.status(400).json({ error: 'clientId required' });
         return;
@@ -2118,7 +2131,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         res.status(400).json({ error: 'surface must be null or one of: verbs, starter, full' });
         return;
       }
-      const result = await oauthProvider.rescopeClient(clientId, { sourceId, federatedRead, boundSlugPrefixes, surface });
+      // F4b: only this requireAdmin route and the local rescope CLI can write
+      // the dedicated fleet grant. DCR/request_tools have no writer. null
+      // clears to ordinary_remote; the provider writes proof + audit atomically.
+      if (fleetGrant !== undefined && fleetGrant !== null && fleetGrant !== 'fleet_router') {
+        res.status(400).json({ error: 'fleetGrant must be null or fleet_router' });
+        return;
+      }
+      const result = await oauthProvider.rescopeClient(clientId, {
+        sourceId,
+        federatedRead,
+        boundSlugPrefixes,
+        surface,
+        fleetGrant,
+        ...(fleetGrant !== undefined ? { fleetGrantActor: 'admin-api' as const } : {}),
+      });
       // WP4 (amendment 32 / ENG-8): every surface mutation writes an audit
       // row — this endpoint, the rescope CLI, and the request_tools persist.
       if (surface !== undefined) {
@@ -2134,7 +2161,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Rescope failed';
       const status = /No OAuth client found/.test(message) ? 404
-        : /Invalid source_id|requires --source|cannot be empty|does not exist|cannot be an empty list|bound_slug_prefixes entr|--surface must be/.test(message) ? 400
+        : /Invalid source_id|requires --source|cannot be empty|does not exist|cannot be an empty list|bound_slug_prefixes entr|--surface must be|--fleet-grant must be/.test(message) ? 400
         : 500;
       res.status(status).json({ error: message });
     }

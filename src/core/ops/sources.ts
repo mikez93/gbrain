@@ -8,6 +8,7 @@
 
 import type { Operation } from './contract.ts';
 import { OperationError } from './contract.ts';
+import { isFleetRouterContext } from './fleet-router-context.ts';
 
 // --- v0.28: whoami + sources management ---
 
@@ -15,7 +16,7 @@ const whoami: Operation = {
   name: 'whoami',
   description:
     'Introspect the calling identity. Returns one of three transport shapes: ' +
-    '{transport: "oauth", client_id, client_name, scopes, expires_at, source_id, federated_read}, ' +
+    '{transport: "oauth", client_id, client_name, scopes, expires_at, source_id, federated_read, fleet_router_granted, fleet_grant_version}, ' +
     '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
     '{transport: "local", scopes: []}, or {transport: "stdio", scopes: []} ' +
     'for the auth-less stdio MCP pipe. Throws unknown_transport when the ' +
@@ -61,6 +62,8 @@ const whoami: Operation = {
         // widens nothing; absent grants serialize fail-closed (null / []).
         source_id: ctx.auth.sourceId ?? null,
         federated_read: ctx.auth.allowedSources ?? [],
+        fleet_router_granted: isFleetRouterContext(ctx),
+        fleet_grant_version: ctx.auth.fleetGrantVersion ?? null,
       };
     }
     return {

@@ -89,6 +89,38 @@ describe('verifyAccessToken surface threading (WP4)', () => {
     expect(after[0].surface).toBe('full');
     expect(after[0].surface_set_by).toBe('operator');
   });
+
+  test('surface set/clear and fleet grant set/clear remain independent axes', async () => {
+    const { clientId, token } = await mintVerifiedClient('surface-fleet-axis-client');
+    await provider.rescopeClient(clientId, { surface: 'full' });
+    let info = await provider.verifyAccessToken(token) as unknown as CoreAuthInfo;
+    expect(info.surface).toBe('full');
+    expect(info.fleetGrant).toBe('ordinary_remote');
+
+    const granted = await provider.rescopeClient(clientId, {
+      fleetGrant: 'fleet_router',
+      fleetGrantVia: 'rescope_cli',
+    });
+    expect(granted.fleetGrantEventId).toBeInteger();
+    info = await provider.verifyAccessToken(token) as unknown as CoreAuthInfo;
+    expect(info.surface).toBe('full');
+    expect(info.surfaceSetBy).toBe('operator');
+    expect(info.fleetGrant).toBe('fleet_router');
+
+    await provider.rescopeClient(clientId, { surface: null });
+    info = await provider.verifyAccessToken(token) as unknown as CoreAuthInfo;
+    expect(info.surface).toBeUndefined();
+    expect(info.fleetGrant).toBe('fleet_router');
+
+    const cleared = await provider.rescopeClient(clientId, {
+      fleetGrant: null,
+      fleetGrantVia: 'rescope_cli',
+    });
+    expect(cleared.fleetGrantEventId).toBeInteger();
+    info = await provider.verifyAccessToken(token) as unknown as CoreAuthInfo;
+    expect(info.surface).toBeUndefined();
+    expect(info.fleetGrant).toBe('ordinary_remote');
+  });
 });
 
 describe('degrade ladder: v127 rung (amendment 17 / ENG-9)', () => {

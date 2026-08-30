@@ -12,8 +12,8 @@ src/commands/sync.ts	4512	ratchet	grown v0.46.26.0 megawave: image sync, ingest-
 src/core/ai/gateway.ts	4561	ratchet	grown v0.46.26.0 megawave plus Kepler OpenRouter Voyage reranker compatibility
 src/cli.ts	3737	ratchet	grown by downstream v0.46.28 disposition CLI and exact source_ids-before-ambient routing
 src/core/cycle.ts	3171	ratchet	grown v0.46.26.0 megawave (#4102 #2608) + master v0.46.26.0 cycle-start orphan recovery
-src/commands/serve-http.ts	3294	ratchet	grown v0.46.25.0 D2: /mcp per-request teardown (#2844)
-src/commands/jobs.ts	3111	ratchet	grown v0.46.26.0 megawave (#4098 #2308) + master v0.46.26.0 worker startup recovery + stats gating
+src/commands/serve-http.ts	3321	ratchet	grown v143: admin fleet-router grant registration/rescope readback
+src/commands/jobs.ts	3172	ratchet	grown v143: strict versioned facts-absorb durable execution identity validation
 src/core/search/hybrid.ts	2881	ratchet	grown v0.46.28 fleet retrieval and downstream disposition-aware search metadata
 src/core/engine.ts	2495	ratchet	grown v0.46.26.0 megawave: relational/visibility/usage contract surface (#4352 #4218)
 src/commands/autopilot.ts	2660	ratchet	grown v0.46.26.0 megawave plus Kepler immutable GBRAIN_BIN worker pin
@@ -38,3 +38,4 @@ src/core/bootstrap/harness.ts	1947	ratchet
 src/commands/hook.ts	1559	ratchet	cathedral-5 heartbeat extraction offsets part of the BrainBench-seam growth; grown v0.46.26.0 megawave hooks-ipc (#4245)
 src/core/chunkers/code.ts	1556	ratchet	new row: crossed the 1500 unlisted cap in v0.46.26.0 megawave (decorated-python defs #3821, version-gate + timeout chunker fixes)
 src/core/config.ts	1503	ratchet	new row: crossed the 1500 unlisted cap in v0.46.26.0 megawave (spend-controls hint #3703, config-set validation)
+src/core/oauth-provider.ts	1604	ratchet	new row: crossed 1500 in v143 dedicated fleet-router grant projection + atomic audited mutation

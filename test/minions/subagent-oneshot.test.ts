@@ -69,6 +69,8 @@ async function makeCtx(data: SubagentHandlerData): Promise<MinionJobContext> {
   return {
     id: job.id,
     name: job.name,
+    queue: job.queue,
+    idempotency_key: job.idempotency_key,
     data: data as unknown as Record<string, unknown>,
     attempts_made: 0,
     signal: ac.signal,

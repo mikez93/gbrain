@@ -126,14 +126,29 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   }, 30_000);
 
   // Helper: mint a token with given scopes
-  async function mintToken(scope = 'read write'): Promise<{ access_token: string; expires_in: number; scope: string }> {
+  async function mintTokenFor(
+    targetClientId: string,
+    targetClientSecret: string,
+    scope = 'read write',
+  ): Promise<{ access_token: string; expires_in: number; scope: string }> {
     const res = await fetch(`${BASE}/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `grant_type=client_credentials&client_id=${clientId}&client_secret=${clientSecret}&scope=${encodeURIComponent(scope)}`,
+      body: new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: targetClientId,
+        client_secret: targetClientSecret,
+        scope,
+      }),
     });
     expect(res.ok).toBe(true);
     return res.json() as any;
+  }
+
+  async function mintToken(scope = 'read write'): Promise<{ access_token: string; expires_in: number; scope: string }> {
+    expect(clientId).toBeTruthy();
+    expect(clientSecret).toBeTruthy();
+    return mintTokenFor(clientId!, clientSecret!, scope);
   }
 
   // Helper: call MCP JSON-RPC with a bearer token
@@ -147,6 +162,26 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, ...(params ? { params } : {}) }),
     });
+  }
+
+  async function mcpToolValue(
+    token: string,
+    name: string,
+    args: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>> {
+    const response = await mcpCall(token, 'tools/call', {
+      name,
+      arguments: args,
+    });
+    const text = await response.text();
+    expect(response.ok).toBe(true);
+    const dataLine = text.split('\n').find(line => line.startsWith('data:'));
+    const envelope = JSON.parse(dataLine ? dataLine.slice(5).trim() : text);
+    expect(envelope.error).toBeUndefined();
+    expect(envelope.result?.isError).not.toBe(true);
+    const content = envelope.result?.content?.[0]?.text;
+    expect(typeof content).toBe('string');
+    return JSON.parse(content);
   }
 
   async function adminCookie(): Promise<string> {
@@ -305,6 +340,97 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       clientName: 'e2e-oauth-test',
       sourceId: 'default',
       federatedRead: ['default'],
+    });
+
+    const grantRes = await fetch(`${BASE}/admin/api/rescope-client`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId, fleetGrant: 'fleet_router' }),
+    });
+    expect(grantRes.ok).toBe(true);
+    const granted = await grantRes.json() as Record<string, unknown>;
+    expect(granted).toMatchObject({
+      clientId,
+      sourceId: 'default',
+      federatedRead: ['default'],
+      fleetGrant: 'fleet_router',
+      fleetGrantOld: 'ordinary_remote',
+      fleetGrantVersion: 1,
+      fleetGrantSetBy: 'operator',
+      fleetGrantEventId: expect.any(Number),
+    });
+    expect(granted.fleetGrantSetAt).toBeTruthy();
+    const grantedToken = await mintToken('read');
+    expect(await mcpToolValue(grantedToken.access_token, 'whoami')).toMatchObject({
+      transport: 'oauth',
+      client_id: clientId,
+      scopes: expect.arrayContaining(['read']),
+      source_id: 'default',
+      federated_read: ['default'],
+      fleet_router_granted: true,
+      fleet_grant_version: 1,
+    });
+
+    const clearRes = await fetch(`${BASE}/admin/api/rescope-client`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId, fleetGrant: null }),
+    });
+    expect(clearRes.ok).toBe(true);
+    expect(await clearRes.json()).toMatchObject({
+      clientId,
+      sourceId: 'default',
+      federatedRead: ['default'],
+      fleetGrant: 'ordinary_remote',
+      fleetGrantOld: 'fleet_router',
+      fleetGrantVersion: 1,
+      fleetGrantSetBy: 'operator',
+      fleetGrantEventId: expect.any(Number),
+    });
+    const clearedToken = await mintToken('read');
+    expect(await mcpToolValue(clearedToken.access_token, 'whoami')).toMatchObject({
+      transport: 'oauth',
+      client_id: clientId,
+      scopes: expect.arrayContaining(['read']),
+      source_id: 'default',
+      federated_read: ['default'],
+      fleet_router_granted: false,
+      fleet_grant_version: 1,
+    });
+
+    const registerFleetRes = await fetch(`${BASE}/admin/api/register-client`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: `e2e-admin-fleet-${Date.now()}`,
+        scopes: ['read'],
+        source: 'default',
+        fleetRouter: true,
+      }),
+    });
+    expect(registerFleetRes.ok).toBe(true);
+    const registeredFleet = await registerFleetRes.json() as Record<string, unknown>;
+    const registeredFleetId = registeredFleet.clientId as string;
+    const registeredFleetSecret = registeredFleet.clientSecret as string;
+    expect(registeredFleet).toMatchObject({
+      clientId: expect.any(String),
+      clientSecret: expect.any(String),
+      fleetGrant: 'fleet_router',
+      fleetGrantVersion: 1,
+      fleetGrantEventId: expect.any(Number),
+    });
+    dcrClientIds.push(registeredFleetId);
+    const registeredFleetToken = await mintTokenFor(
+      registeredFleetId, registeredFleetSecret, 'read',
+    );
+    expect(await mcpToolValue(registeredFleetToken.access_token, 'whoami')).toMatchObject({
+      transport: 'oauth',
+      client_id: registeredFleetId,
+      scopes: expect.arrayContaining(['read']),
+      source_id: 'default',
+      federated_read: ['default'],
+      fleet_router_granted: true,
+      fleet_grant_version: 1,
     });
 
     const agentsRes = await fetch(`${BASE}/admin/api/agents`, {

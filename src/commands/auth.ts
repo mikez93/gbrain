@@ -434,6 +434,7 @@ export interface RegisterClientArgs {
   boundMaxConcurrent: number | undefined;
   budgetUsdPerDay: string | undefined;
   tokenTtlSeconds: number | undefined;
+  fleetRouter: boolean;
 }
 
 /** --token-ttl bounds: 1 minute .. 90 days. The SERVER default for CLI-minted
@@ -473,9 +474,11 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
     boundMaxConcurrent: undefined,
     budgetUsdPerDay: undefined,
     tokenTtlSeconds: undefined,
+    fleetRouter: false,
   };
   let i = 0;
   let grantTypesSet = false;
+  let fleetRouterSet = false;
   while (i < args.length) {
     const flag = args[i];
     const value = args[i + 1];
@@ -486,6 +489,13 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
       return value;
     };
     switch (flag) {
+      case '--fleet-router': {
+        if (fleetRouterSet) throw new Error('--fleet-router may be passed only once');
+        fleetRouterSet = true;
+        out.fleetRouter = true;
+        i += 1;
+        break;
+      }
       case '--grant-types': {
         const v = requireValue();
         out.grantTypes = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -593,7 +603,8 @@ export async function preflightOauthClientColumns(sql: SqlQuery): Promise<Set<st
     SELECT column_name FROM information_schema.columns
     WHERE table_name = 'oauth_clients'
       AND table_schema = current_schema()
-      AND column_name IN ('token_ttl', 'surface', 'federated_read', 'source_id', 'deleted_at')
+      AND column_name IN ('token_ttl', 'surface', 'federated_read', 'source_id', 'deleted_at',
+                          'fleet_grant', 'fleet_grant_version', 'fleet_grant_set_by', 'fleet_grant_set_at')
   `;
   return new Set(rows.map(r => String(r.column_name)));
 }
@@ -605,6 +616,9 @@ export interface RegisterScopedClientOpts {
    * ONLY surface-column writer (sets surface_set_by='operator', the lock
    * request_tools cannot override). Never a raw column UPDATE. */
   surface?: 'verbs' | 'starter' | 'full';
+  /** Audit provenance for explicit fleet-router registration. */
+  fleetGrantActor?: 'operator' | 'admin-api';
+  fleetGrantVia?: 'register_cli' | 'admin_api';
   /** Result of preflightOauthClientColumns — decides which optional-column
    * writes are attempted. Absent → attempt everything (caller owns errors). */
   columns?: Set<string>;
@@ -630,6 +644,11 @@ export interface RegisteredClient {
   /** Previous surface row value when opts.surface was written (for the
    * post-commit audit row — audit is fail-open and NEVER runs in the tx). */
   surfaceOld?: string | null;
+  fleetGrant: 'ordinary_remote' | 'fleet_router';
+  fleetGrantVersion: 0 | 1;
+  fleetGrantSetBy?: 'operator';
+  fleetGrantSetAt?: string;
+  fleetGrantEventId?: number;
   /** Optional-column writes skipped by the pre-flight (pre-migration brain). */
   skipped?: { tokenTtl?: boolean; surface?: boolean };
 }
@@ -702,6 +721,28 @@ export async function registerScopedClient(
     }
   }
 
+  let fleetGrant: 'ordinary_remote' | 'fleet_router' = 'ordinary_remote';
+  let fleetGrantVersion: 0 | 1 = 0;
+  let fleetGrantSetBy: 'operator' | undefined;
+  let fleetGrantSetAt: string | undefined;
+  let fleetGrantEventId: number | undefined;
+  if (parsed.fleetRouter) {
+    const required = ['fleet_grant', 'fleet_grant_version', 'fleet_grant_set_by', 'fleet_grant_set_at'];
+    if (opts.columns && required.some((column) => !opts.columns!.has(column))) {
+      throw new Error('--fleet-router requires an up-to-date OAuth schema; run `gbrain apply-migrations --yes` and retry. The newly registered row remains ordinary_remote.');
+    }
+    const rescoped = await provider.rescopeClient(clientId, {
+      fleetGrant: 'fleet_router',
+      fleetGrantActor: opts.fleetGrantActor ?? 'operator',
+      fleetGrantVia: opts.fleetGrantVia ?? 'register_cli',
+    });
+    fleetGrant = rescoped.fleetGrant!;
+    fleetGrantVersion = rescoped.fleetGrantVersion!;
+    fleetGrantSetBy = rescoped.fleetGrantSetBy;
+    fleetGrantSetAt = rescoped.fleetGrantSetAt;
+    fleetGrantEventId = rescoped.fleetGrantEventId;
+  }
+
   return {
     clientId,
     ...(clientSecret ? { clientSecret } : {}),
@@ -714,6 +755,11 @@ export async function registerScopedClient(
     ...(tokenTtl !== undefined ? { tokenTtl } : {}),
     ...(surfaceApplied !== undefined ? { surface: surfaceApplied } : {}),
     ...(surfaceOld !== undefined ? { surfaceOld } : {}),
+    fleetGrant,
+    fleetGrantVersion,
+    ...(fleetGrantSetBy !== undefined ? { fleetGrantSetBy } : {}),
+    ...(fleetGrantSetAt !== undefined ? { fleetGrantSetAt } : {}),
+    ...(fleetGrantEventId !== undefined ? { fleetGrantEventId } : {}),
     created: { source: false },
     ...(ttlSkipped || surfaceSkipped
       ? { skipped: { ...(ttlSkipped ? { tokenTtl: true } : {}), ...(surfaceSkipped ? { surface: true } : {}) } }
@@ -747,6 +793,9 @@ export function formatRegisterClientOutput(name: string, r: RegisteredClient, pa
   }
   lines.push(`  Write source:        ${r.sourceId}`);
   lines.push(`  Federated reads:     ${r.federatedRead.join(', ')}`);
+  lines.push(`  Fleet router grant:  ${r.fleetGrant}${r.fleetGrant === 'fleet_router'
+    ? ` (v${r.fleetGrantVersion}; event ${r.fleetGrantEventId})`
+    : ''}`);
   if (hasBindings) {
     lines.push(`  Bound tools:         ${(parsed.boundTools ?? []).join(', ') || '<none>'}`);
     lines.push(`  Bound source:        ${parsed.boundSourceId ?? '<none>'}`);
@@ -767,7 +816,7 @@ export function formatRegisterClientOutput(name: string, r: RegisteredClient, pa
 
 async function registerClient(name: string, args: string[]) {
   if (!name) {
-    console.error('Usage: auth register-client <name> [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD] [--token-ttl SECONDS]');
+    console.error('Usage: auth register-client <name> [--fleet-router] [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD] [--token-ttl SECONDS]');
     process.exit(1);
   }
   let parsed: RegisterClientArgs;
@@ -775,13 +824,13 @@ async function registerClient(name: string, args: string[]) {
     parsed = parseRegisterClientArgs(args);
   } catch (e: any) {
     console.error(`Error: ${e.message}`);
-    console.error('Usage: auth register-client <name> [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD] [--token-ttl SECONDS]');
+    console.error('Usage: auth register-client <name> [--fleet-router] [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD] [--token-ttl SECONDS]');
     process.exit(1);
   }
 
   try {
     await withConfiguredSql(async (sql) => {
-      const columns = parsed.tokenTtlSeconds !== undefined
+      const columns = parsed.tokenTtlSeconds !== undefined || parsed.fleetRouter
         ? await preflightOauthClientColumns(sql)
         : undefined;
       const registered = await registerScopedClient(sql, name, parsed, { columns });
@@ -817,8 +866,15 @@ export function parseRescopeSurfaceValue(value: string): 'verbs' | 'starter' | '
   return undefined;
 }
 
+/** F4b (v143): parse the dedicated operator-only fleet grant. */
+export function parseRescopeFleetGrantValue(value: string): 'fleet_router' | null | undefined {
+  if (value === 'clear') return null;
+  if (value === 'fleet_router') return value;
+  return undefined;
+}
+
 async function rescopeClient(clientId: string, args: string[]) {
-  const usage = 'Usage: auth rescope-client <client_id> [--source SOURCE] [--federated-read SRC1,SRC2,...] [--bound-slug-prefixes P1,P2|none] [--surface verbs|starter|full|clear]';
+  const usage = 'Usage: auth rescope-client <client_id> [--source SOURCE] [--federated-read SRC1,SRC2,...] [--bound-slug-prefixes P1,P2|none] [--surface verbs|starter|full|clear] [--fleet-grant fleet_router|clear]';
   if (!clientId) {
     console.error(usage);
     process.exit(1);
@@ -832,6 +888,7 @@ async function rescopeClient(clientId: string, args: string[]) {
   // WP4: tri-state — undefined = untouched, null = clear ('clear'), value =
   // set + surface_set_by='operator' (the lock request_tools cannot override).
   let surface: 'verbs' | 'starter' | 'full' | null | undefined;
+  let fleetGrant: 'fleet_router' | null | undefined;
   for (let i = 0; i < args.length; i += 2) {
     const flag = args[i];
     const value = args[i + 1];
@@ -854,14 +911,21 @@ async function rescopeClient(clientId: string, args: string[]) {
         console.error(usage);
         process.exit(1);
       }
+    } else if (flag === '--fleet-grant') {
+      fleetGrant = parseRescopeFleetGrantValue(value);
+      if (fleetGrant === undefined) {
+        console.error(`Error: --fleet-grant must be fleet_router | clear (got "${value}")`);
+        console.error(usage);
+        process.exit(1);
+      }
     } else {
       console.error(`Error: Unknown flag: ${flag}`);
       console.error(usage);
       process.exit(1);
     }
   }
-  if (sourceId === undefined && federatedRead === undefined && boundSlugPrefixes === undefined && surface === undefined) {
-    console.error('Error: pass --source, --federated-read, --bound-slug-prefixes, and/or --surface');
+  if (sourceId === undefined && federatedRead === undefined && boundSlugPrefixes === undefined && surface === undefined && fleetGrant === undefined) {
+    console.error('Error: pass --source, --federated-read, --bound-slug-prefixes, --surface, and/or --fleet-grant');
     console.error(usage);
     process.exit(1);
   }
@@ -869,7 +933,7 @@ async function rescopeClient(clientId: string, args: string[]) {
     await withConfiguredSql(async (sql, engine) => {
       const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
       const provider = new GBrainOAuthProvider({ sql });
-      const result = await provider.rescopeClient(clientId, { sourceId, federatedRead, boundSlugPrefixes, surface });
+      const result = await provider.rescopeClient(clientId, { sourceId, federatedRead, boundSlugPrefixes, surface, fleetGrant });
       // WP4 (amendment 32 / ENG-8): every surface mutation writes an audit
       // row (this CLI, the admin endpoint, the request_tools persist).
       if (surface !== undefined) {
@@ -890,6 +954,9 @@ async function rescopeClient(clientId: string, args: string[]) {
       }
       if (result.surface !== undefined) {
         console.log(`  Tool surface:        ${result.surface ?? '<cleared — server/config surface applies>'}${result.surface != null ? ' (operator-pinned; request_tools cannot override)' : ''}`);
+      }
+      if (result.fleetGrant !== undefined) {
+        console.log(`  Fleet grant:         ${result.fleetGrant} v${result.fleetGrantVersion} (set by ${result.fleetGrantSetBy} at ${result.fleetGrantSetAt}; event ${result.fleetGrantEventId})`);
       }
       console.log('\nTakes effect on the client\'s next request (existing tokens included).');
     });
@@ -937,6 +1004,10 @@ export interface ClientRow {
   scope: string | null;
   surface: string | null;
   surface_set_by: string | null;
+  fleet_grant: string | null;
+  fleet_grant_version: number | null;
+  fleet_grant_set_by: string | null;
+  fleet_grant_set_at: string | null;
   source_id: string | null;
   federated_read: string[] | null;
 }
@@ -956,23 +1027,34 @@ export async function listClientRows(engine: BrainEngine): Promise<ClientRow[]> 
   // 42703 by code; the column list covers message-only (code-less) variants.
   const isSchemaShapeError = (e: unknown): boolean =>
     isUndefinedTableError(e) ||
-    ['surface', 'surface_set_by', 'source_id', 'federated_read']
+    ['fleet_grant', 'fleet_grant_version', 'fleet_grant_set_by', 'fleet_grant_set_at', 'surface', 'surface_set_by', 'source_id', 'federated_read']
       .some(col => isUndefinedColumnError(e, col));
   try {
     return await engine.executeRaw<ClientRow>(
-      `SELECT client_id, client_name, scope, surface, surface_set_by, source_id, federated_read
+      `SELECT client_id, client_name, scope, surface, surface_set_by,
+              fleet_grant, fleet_grant_version, fleet_grant_set_by, fleet_grant_set_at,
+              source_id, federated_read
          FROM oauth_clients ORDER BY client_name, client_id`,
     );
   } catch (e) {
-    // Brain predates the surface columns — fall through. Rethrow non-shape errors.
+    // Brain predates the fleet-grant columns — retain the full pre-v143 shape.
     if (!isSchemaShapeError(e)) throw e;
   }
   try {
-    const mid = await engine.executeRaw<Omit<ClientRow, 'surface' | 'surface_set_by'>>(
+    const preGrant = await engine.executeRaw<Omit<ClientRow, 'fleet_grant' | 'fleet_grant_version' | 'fleet_grant_set_by' | 'fleet_grant_set_at'>>(
+      `SELECT client_id, client_name, scope, surface, surface_set_by, source_id, federated_read
+         FROM oauth_clients ORDER BY client_name, client_id`,
+    );
+    return preGrant.map(r => ({ ...r, fleet_grant: null, fleet_grant_version: null, fleet_grant_set_by: null, fleet_grant_set_at: null }));
+  } catch (e) {
+    if (!isSchemaShapeError(e)) throw e;
+  }
+  try {
+    const mid = await engine.executeRaw<Omit<ClientRow, 'surface' | 'surface_set_by' | 'fleet_grant' | 'fleet_grant_version' | 'fleet_grant_set_by' | 'fleet_grant_set_at'>>(
       `SELECT client_id, client_name, scope, source_id, federated_read
          FROM oauth_clients ORDER BY client_name, client_id`,
     );
-    return mid.map(r => ({ ...r, surface: null, surface_set_by: null }));
+    return mid.map(r => ({ ...r, surface: null, surface_set_by: null, fleet_grant: null, fleet_grant_version: null, fleet_grant_set_by: null, fleet_grant_set_at: null }));
   } catch (e) {
     // Brain predates the source-scoping columns — fall through likewise.
     if (!isSchemaShapeError(e)) throw e;
@@ -980,7 +1062,7 @@ export async function listClientRows(engine: BrainEngine): Promise<ClientRow[]> 
   const bare = await engine.executeRaw<Pick<ClientRow, 'client_id' | 'client_name' | 'scope'>>(
     `SELECT client_id, client_name, scope FROM oauth_clients ORDER BY client_name, client_id`,
   );
-  return bare.map(r => ({ ...r, surface: null, surface_set_by: null, source_id: null, federated_read: null }));
+  return bare.map(r => ({ ...r, surface: null, surface_set_by: null, fleet_grant: null, fleet_grant_version: null, fleet_grant_set_by: null, fleet_grant_set_at: null, source_id: null, federated_read: null }));
 }
 
 async function clientsCmd(args: string[]) {
@@ -1015,6 +1097,10 @@ async function clientsCmd(args: string[]) {
             scopes: c.scope,
             surface: c.surface,
             surface_set_by: c.surface_set_by,
+            fleet_grant: c.fleet_grant,
+            fleet_grant_version: c.fleet_grant_version,
+            fleet_grant_set_by: c.fleet_grant_set_by,
+            fleet_grant_set_at: c.fleet_grant_set_at,
             source_id: c.source_id,
             federated_read: c.federated_read,
             usage: usageByToken.get(c.client_id) ?? null,
@@ -1039,6 +1125,11 @@ async function clientsCmd(args: string[]) {
           : '<server/config resolution>';
         console.log(`  scopes: ${c.scope ?? '<none>'}    surface: ${surfaceStr}`);
         console.log(`  write source: ${c.source_id ?? '<none>'}    federated reads: ${(c.federated_read ?? []).join(', ') || '<none>'}`);
+        const fleetGrant = c.fleet_grant ?? 'ordinary_remote (schema not projected)';
+        const fleetProof = c.fleet_grant_set_by && c.fleet_grant_set_at
+          ? ` (set by ${c.fleet_grant_set_by} at ${c.fleet_grant_set_at})`
+          : '';
+        console.log(`  fleet grant: ${fleetGrant}${c.fleet_grant_version !== null ? ` v${c.fleet_grant_version}` : ''}${fleetProof}`);
         if (parsed.usage) {
           if (u) {
             const auto = u.likely_automation ? '    [automation-shaped: >90% context_pack/delta]' : '';
@@ -1193,6 +1284,9 @@ Usage:
                                                           request_tools cannot override; 'clear' removes the pin
                                                           so server/config resolution applies again). Always
                                                           bounded by the server's --surface ceiling.
+     --fleet-grant <fleet_router|clear>                  Grant or revoke the dedicated fleet-router private-lineage
+                                                          read capability. Operator-only, audited, and effective on
+                                                          the client's next request (existing tokens included).
   gbrain auth clients [--usage] [--days N] [--json]       List OAuth clients with scopes, write source, federated
                                                           reads + tool surface. --usage
                                                           joins per-client op-call counts, top ops, and last-seen
