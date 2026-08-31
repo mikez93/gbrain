@@ -30,6 +30,22 @@ const DIGEST =
 const GUARDIAN = 'a'.repeat(64);
 const HOLD = 'b'.repeat(64);
 const NOW = '2026-08-30T00:01:00.000000Z';
+const FOCUSED_COMMAND_ARGV = [
+  'bun',
+  '--config=/dev/null',
+  'test',
+  'test/exact-target-schema-pure.test.ts',
+] as const;
+const ORDER1_PARENT_DESIGN_SHA256 =
+  '128a5f55ba0a20a30247d21466ae5e07ed7e038b73dca88a9c383276edd9a367';
+const ORDER1_GAP_MAP_SHA256 =
+  'e30f63659ed74cd32b61f6a0271a586ea54f214a979102b6ce6bb4cb3c22a62e';
+const ORDER1_EXTERNAL_GATES_V7_HISTORICAL_SHA256 =
+  '5550ff092982b895f4e08a1948a23f0357ac23cafae71eec6ba570a638bef9fc';
+const ORDER1_EXTERNAL_GATES_V8_CONTROLLING_SHA256 =
+  '3e5ef48a9ab7aa5e3a807552e6d2536bac73d9c1c560431202c0c34c83fe8081';
+const ORDER1_CHECKLIST_V4_SHA256 =
+  '9ff1a6af181e1964e8e798e8b8e390df4f7db34ad1ee99c41fe80db349ea6410';
 
 const EXPECTED_ROW_LINES = [
   'attempts_made|integer|int4|NO',
@@ -137,20 +153,29 @@ function validate(
   return validateExactTargetSchema(value);
 }
 
+type RejectedDecision = Extract<
+  ReturnType<typeof validateExactTargetSchema>,
+  { readonly ok: false }
+>;
+
 function expectReason(
   value: ValidateExactTargetSchemaInput,
   reason: ExactTargetSchemaReason,
-): void {
+): RejectedDecision {
   const previousState = value.consumption_state;
-  const result = validate(value);
+  let result: ReturnType<typeof validateExactTargetSchema> | undefined;
+  expect(() => {
+    result = validate(value);
+  }).not.toThrow();
+  if (result === undefined) throw new Error(`missing rejection ${reason}`);
   expect(result.ok).toBe(false);
   if (result.ok) throw new Error(`expected rejection ${reason}`);
   expect(result.reason_code).toBe(reason);
   expect(result.reason_family).toBe(EXACT_TARGET_SCHEMA_REASON_FAMILIES[reason]);
   expect(result.consumption_state).toEqual(previousState);
   expect(result.consumption_state).not.toBe(previousState);
-  expect(Object.isFrozen(result)).toBe(true);
-  expect(Object.isFrozen(result.consumption_state)).toBe(true);
+  expect(recursivelyFrozen(result)).toBe(true);
+  return result;
 }
 
 function replaceRow(
@@ -186,6 +211,8 @@ const mutationHistogram: Record<string, number> = {
   singletons: 0,
 };
 const mutationReasons = new Set<ExactTargetSchemaReason>();
+const parentMutationResults: Record<string, unknown>[] = [];
+const parentPositiveResults: Record<string, unknown>[] = [];
 
 function recordMutation(
   id: string,
@@ -196,8 +223,19 @@ function recordMutation(
   expect(mutationIds.has(id), `duplicate mutation id: ${id}`).toBe(false);
   mutationIds.add(id);
   mutationHistogram[group] += 1;
-  mutationReasons.add(reason);
-  expectReason(value, reason);
+  const result = expectReason(value, reason);
+  mutationReasons.add(result.reason_code);
+  parentMutationResults.push({
+    id,
+    group,
+    reason: result.reason_code,
+    family: result.reason_family,
+    pass: true,
+    no_throw: true,
+    decision_recursive_frozen: recursivelyFrozen(result),
+    state_nonaliased: result.consumption_state !== value.consumption_state,
+    decision_graph_sha256: graphSha256(result),
+  });
 }
 
 type StateKind = 'frozen_copy' | 'null';
@@ -644,6 +682,40 @@ function recursivelyFrozen(value: unknown, seen = new Set<object>()): boolean {
   return true;
 }
 
+function objectReferences(value: unknown): Set<object> {
+  const references = new Set<object>();
+  const visit = (current: unknown): void => {
+    if ((typeof current !== 'object' || current === null) && typeof current !== 'function') {
+      return;
+    }
+    const object = current as object;
+    if (references.has(object)) return;
+    references.add(object);
+    for (const key of Reflect.ownKeys(object)) {
+      const descriptor = Object.getOwnPropertyDescriptor(object, key)!;
+      if ('value' in descriptor) visit(descriptor.value);
+    }
+  };
+  visit(value);
+  return references;
+}
+
+function recordParentPositive(
+  id: string,
+  result: AcceptedDecision,
+): void {
+  parentPositiveResults.push({
+    id,
+    pass: true,
+    normalized_rows: result.normalized_rows.length,
+    serialized_bytes: result.serialized_bytes,
+    schema_sha256: result.schema_sha256,
+    state_status: result.consumption_state.status,
+    decision_recursive_frozen: recursivelyFrozen(result),
+    decision_graph_sha256: graphSha256(result),
+  });
+}
+
 function impossibleMutation(mutate: () => unknown): { threw: boolean; result: unknown } {
   try {
     return { threw: false, result: mutate() };
@@ -726,6 +798,44 @@ function canonicalJson(value: unknown): string {
       .join(',')}}`;
   }
   return JSON.stringify(value);
+}
+
+const X1_MUTATION_EXPECTED =
+  'strict-mode throw or observably impossible; recursively canonicalized decision graph bytes unchanged';
+
+function x1CatalogEntry(
+  id: string,
+  caseId: string,
+  stateKind: StateKind,
+  target: string,
+  operation: string,
+): Record<string, unknown> {
+  return {
+    id,
+    case_id: caseId,
+    state_kind: stateKind,
+    target,
+    operation,
+    expected: X1_MUTATION_EXPECTED,
+  };
+}
+
+function x1MutationRecipe(target: string, operation: string): string {
+  if (target === 'decision_root') {
+    if (operation === 'set') return "strict assignment decision.reason_code='attacker'";
+    if (operation === 'delete') return 'strict delete decision.reason_code';
+    if (operation === 'redefine') {
+      return "Object.defineProperty(decision,'reason_code',{value:'attacker'})";
+    }
+    return 'Object.setPrototypeOf(decision,attackerPrototype)';
+  }
+  if (target === 'consumption_state') {
+    return 'Object.setPrototypeOf(decision.consumption_state,attackerPrototype)';
+  }
+  const property = target.endsWith('.key') ? 'key' : 'status';
+  if (operation === 'set') return `strict assignment decision.consumption_state.${property}`;
+  if (operation === 'delete') return `strict delete decision.consumption_state.${property}`;
+  return `Object.defineProperty(decision.consumption_state,'${property}',attackerDescriptor)`;
 }
 
 function x3CatalogEntry(operation: X3OutputOperation): Record<string, unknown> {
@@ -928,19 +1038,52 @@ function x3CatalogEntry(operation: X3OutputOperation): Record<string, unknown> {
 describe('exact-target pure schema and attestation validator', () => {
   const x1Receipt = {
     caseResultsSha256: '',
+    catalogSha256: '',
     mutationResultsSha256: '',
     frozenStates: 0,
     nullStates: 0,
+    decisionsRecursiveFrozen: 0,
+    decisionsNonaliased: 0,
+    decisionMutationPasses: 0,
+    stateMutationPasses: 0,
     mutationPasses: 0,
+    graphEqual: 0,
+    reasons: new Set<ExactTargetSchemaReason>(),
   };
-  const x2Receipt = { invalidPasses: 0, positivePasses: 0 };
+  const x2Receipt = {
+    invalidPasses: 0,
+    positivePasses: 0,
+    reasonObservations: 0,
+    resultSha256: '',
+    positiveResultSha256: '',
+    reasons: new Set<ExactTargetSchemaReason>(),
+  };
   const x3Receipt = {
     callerPasses: 0,
+    callerResultsSha256: '',
     outputPasses: 0,
     catalogSha256: '',
     mutationResultsSha256: '',
     graphEqual: 0,
     reflectFalse: 0,
+    reflectFalsePasses: 0,
+    recursiveFrozen: false,
+    inputAliasCount: 0,
+    callerObjectFrozenCount: 0,
+    stateAliasPasses: 0,
+    returnedStateContainerPasses: 0,
+    exactDecisionPropertyPasses: 0,
+  };
+  const stateReceipt = {
+    id: '',
+    resultSha256: '',
+    decisionGraphSha256: '',
+    returnedStateGraphSha256: '',
+    reason: '' as ExactTargetSchemaReason | '',
+    family: '',
+    recursiveFrozen: false,
+    stateNonaliased: false,
+    noThrow: false,
   };
 
   test('X1 rejects the exact 187 hostile runtime inputs and proves 1,665 immutable mutations', () => {
@@ -955,6 +1098,7 @@ describe('exact-target pure schema and attestation validator', () => {
 
     const caseResults: unknown[] = [];
     const mutationIds: string[] = [];
+    const mutationCatalog: Record<string, unknown>[] = [];
     const mutationResults: unknown[] = [];
     for (const fixture of cases) {
       const candidate = fixture.make();
@@ -967,6 +1111,7 @@ describe('exact-target pure schema and attestation validator', () => {
       if (decision.ok) throw new Error(`expected INPUT rejection for ${fixture.id}`);
       expect(decision.reason_code, fixture.id).toBe('LIVE_SCHEMA_INPUT_REJECTED');
       expect(decision.reason_family, fixture.id).toBe('LIVE_SCHEMA_INPUT_REJECTED');
+      x1Receipt.reasons.add(decision.reason_code);
       expect(Reflect.ownKeys(decision).sort(), fixture.id).toEqual([
         'consumption_state',
         'ok',
@@ -974,6 +1119,9 @@ describe('exact-target pure schema and attestation validator', () => {
         'reason_family',
       ]);
       expect(recursivelyFrozen(decision), fixture.id).toBe(true);
+      x1Receipt.decisionsRecursiveFrozen += Number(recursivelyFrozen(decision));
+      expect(decision, fixture.id).not.toBe(candidate);
+      x1Receipt.decisionsNonaliased += Number(decision !== candidate);
 
       if (fixture.stateKind === 'null') {
         x1Receipt.nullStates += 1;
@@ -1000,6 +1148,8 @@ describe('exact-target pure schema and attestation validator', () => {
         decision_frozen: recursivelyFrozen(decision),
         no_throw: true,
         content_free: Reflect.ownKeys(decision).length === 4,
+        decision_nonaliased: decision !== candidate,
+        decision_graph_sha256: graphSha256(decision),
       });
 
       const baseline = graphSha256(decision);
@@ -1016,9 +1166,27 @@ describe('exact-target pure schema and attestation validator', () => {
         const after = graphSha256(decision);
         const pass = before === baseline && after === baseline && observation.threw;
         expect(pass, id).toBe(true);
+        const target = 'decision_root';
+        const catalogEntry = x1CatalogEntry(
+          id,
+          fixture.id,
+          fixture.stateKind,
+          target,
+          operation,
+        );
         mutationIds.push(id);
-        mutationResults.push({ id, case_id: fixture.id, target: 'decision_root', operation, pass, throw_or_impossible: observation.threw, graph_before_sha256: before, graph_after_sha256: after });
+        mutationCatalog.push(catalogEntry);
+        mutationResults.push({
+          ...catalogEntry,
+          recipe: x1MutationRecipe(target, operation),
+          pass,
+          throw_or_impossible: observation.threw,
+          graph_before_sha256: before,
+          graph_after_sha256: after,
+        });
+        x1Receipt.decisionMutationPasses += Number(pass);
         x1Receipt.mutationPasses += Number(pass);
+        x1Receipt.graphEqual += Number(before === after && after === baseline);
       }
 
       const state = decision.consumption_state;
@@ -1039,9 +1207,29 @@ describe('exact-target pure schema and attestation validator', () => {
           const after = graphSha256(decision);
           const pass = before === baseline && after === baseline && observation.threw;
           expect(pass, id).toBe(true);
+          const exactTarget = target === 'state'
+            ? 'consumption_state'
+            : target.replace('state.', 'consumption_state.');
+          const catalogEntry = x1CatalogEntry(
+            id,
+            fixture.id,
+            fixture.stateKind,
+            exactTarget,
+            operation,
+          );
           mutationIds.push(id);
-          mutationResults.push({ id, case_id: fixture.id, target: target === 'state' ? 'consumption_state' : `consumption_${target}`, operation, pass, throw_or_impossible: observation.threw, graph_before_sha256: before, graph_after_sha256: after });
+          mutationCatalog.push(catalogEntry);
+          mutationResults.push({
+            ...catalogEntry,
+            recipe: x1MutationRecipe(exactTarget, operation),
+            pass,
+            throw_or_impossible: observation.threw,
+            graph_before_sha256: before,
+            graph_after_sha256: after,
+          });
+          x1Receipt.stateMutationPasses += Number(pass);
           x1Receipt.mutationPasses += Number(pass);
+          x1Receipt.graphEqual += Number(before === after && after === baseline);
         }
       }
     }
@@ -1053,9 +1241,19 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(sha256(mutationIds.join('\n'))).toBe(
       'f869fa936c0f2a2d2ab457a6b6f187acc6abf8fff84f6dd9a538bce1e9693709',
     );
+    expect(mutationCatalog).toHaveLength(1665);
+    x1Receipt.catalogSha256 = sha256(canonicalJson(mutationCatalog));
+    expect(x1Receipt.catalogSha256).toBe(
+      '2edfb31eb6507ae574534be54afbef652edc4a2c795246a5f3e4eb22df916655',
+    );
+    expect(x1Receipt.decisionsRecursiveFrozen).toBe(187);
+    expect(x1Receipt.decisionsNonaliased).toBe(187);
+    expect(x1Receipt.decisionMutationPasses).toBe(748);
+    expect(x1Receipt.stateMutationPasses).toBe(917);
     expect(x1Receipt.mutationPasses).toBe(1665);
-    x1Receipt.caseResultsSha256 = sha256(JSON.stringify(caseResults));
-    x1Receipt.mutationResultsSha256 = sha256(JSON.stringify(mutationResults));
+    expect(x1Receipt.graphEqual).toBe(1665);
+    x1Receipt.caseResultsSha256 = sha256(canonicalJson(caseResults));
+    x1Receipt.mutationResultsSha256 = sha256(canonicalJson(mutationResults));
   });
 
   test('matches the authoritative 46-row table coordinate for coordinate', () => {
@@ -1109,6 +1307,7 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(result.serialized_bytes).toBe(1527);
     expect(result.consumption_state).toEqual({ key: GUARDIAN, status: 'consumed' });
     expect(result.scope_limit).toBe(EXACT_TARGET_ATTESTATION_SCOPE_LIMIT);
+    recordParentPositive('PARENT-P01-canonical', result);
   });
 
   test('accepts reverse order with the same normalization and digest', () => {
@@ -1117,6 +1316,7 @@ describe('exact-target pure schema and attestation validator', () => {
     if (!result.ok) throw new Error(result.reason_code);
     expect(result.normalized_rows).toEqual(EXACT_TARGET_SCHEMA_ROWS);
     expect(result.schema_sha256).toBe(DIGEST);
+    recordParentPositive('PARENT-P02-reverse', result);
   });
 
   test('accepts rotate-17 order with the same normalization and digest', () => {
@@ -1130,6 +1330,7 @@ describe('exact-target pure schema and attestation validator', () => {
     if (!result.ok) throw new Error(result.reason_code);
     expect(result.normalized_rows).toEqual(EXACT_TARGET_SCHEMA_ROWS);
     expect(result.schema_sha256).toBe(DIGEST);
+    recordParentPositive('PARENT-P03-rotate-17', result);
   });
 
   test('accepts the frozen seeded order with the same normalization and digest', () => {
@@ -1142,6 +1343,7 @@ describe('exact-target pure schema and attestation validator', () => {
     if (!result.ok) throw new Error(result.reason_code);
     expect(result.normalized_rows).toEqual(EXACT_TARGET_SCHEMA_ROWS);
     expect(result.schema_sha256).toBe(DIGEST);
+    recordParentPositive('PARENT-P04-seeded', result);
   });
 
   test('detects a raw duplicate before an accompanying extra or sort', () => {
@@ -1408,12 +1610,13 @@ describe('exact-target pure schema and attestation validator', () => {
       ['day00', '2026-01-00T00:00:00.000000Z'],
     ] as const;
     const ids: string[] = [];
+    const results: Record<string, unknown>[] = [];
     for (const [prefix, field] of [
       ['N', 'now'],
       ['A', 'acquired_at'],
       ['E', 'expires_at'],
     ] as const) {
-      for (const [index, [, invalid]] of invalidValues.entries()) {
+      for (const [index, [invalidKind, invalid]] of invalidValues.entries()) {
         const id = `X2-${prefix}${index + 1}`;
         ids.push(id);
         const candidate = input({
@@ -1431,7 +1634,11 @@ describe('exact-target pure schema and attestation validator', () => {
           },
         });
         const callerState = candidate.consumption_state;
-        const result = validate(candidate);
+        let result: ReturnType<typeof validateExactTargetSchema> | undefined;
+        expect(() => {
+          result = validate(candidate);
+        }, id).not.toThrow();
+        if (result === undefined) throw new Error(`missing timestamp result for ${id}`);
         expect(result.ok, id).toBe(false);
         if (result.ok) throw new Error(`expected timestamp rejection for ${id}`);
         expect(result.reason_code, id).toBe(
@@ -1440,6 +1647,25 @@ describe('exact-target pure schema and attestation validator', () => {
         expect(result.consumption_state, id).toEqual(callerState);
         expect(result.consumption_state, id).not.toBe(callerState);
         expect(recursivelyFrozen(result), id).toBe(true);
+        x2Receipt.reasons.add(result.reason_code);
+        x2Receipt.reasonObservations += Number(
+          result.reason_code === 'SCHEMA_ATTESTATION_TIMESTAMP_REJECTED',
+        );
+        results.push({
+          id,
+          field,
+          invalid_kind: invalidKind,
+          supplied_value_sha256: sha256(invalid),
+          reason: result.reason_code,
+          family: result.reason_family,
+          pass: true,
+          no_throw: true,
+          state_nonaliased: result.consumption_state !== callerState,
+          decision_recursive_frozen: recursivelyFrozen(result),
+          caller_state_graph_sha256: graphSha256(callerState),
+          returned_state_graph_sha256: graphSha256(result.consumption_state),
+          decision_graph_sha256: graphSha256(result),
+        });
         x2Receipt.invalidPasses += 1;
       }
     }
@@ -1448,19 +1674,35 @@ describe('exact-target pure schema and attestation validator', () => {
       '702a189b342a744640ccf014610ec22c337dd504030f241ed9cf9f9bce95351f',
     );
     expect(x2Receipt.invalidPasses).toBe(12);
+    expect(x2Receipt.reasonObservations).toBe(12);
+    x2Receipt.resultSha256 = sha256(canonicalJson(results));
 
-    const leap = validate(
-      input({
+    const leapCandidate = input({
         attestation: {
           ...ATTESTATION,
           acquired_at: '2028-02-29T00:00:00.000000Z',
           expires_at: '2028-02-29T00:05:00.000000Z',
         },
         now: '2028-02-29T00:01:00.000000Z',
-      }),
-    );
+      });
+    let leap: ReturnType<typeof validateExactTargetSchema> | undefined;
+    expect(() => {
+      leap = validate(leapCandidate);
+    }, 'X2-P01-leap-day').not.toThrow();
+    if (leap === undefined) throw new Error('missing X2 leap-day result');
     expect(leap.ok).toBe(true);
     x2Receipt.positivePasses = Number(leap.ok);
+    if (!leap.ok) throw new Error(`unexpected leap-day rejection: ${leap.reason_code}`);
+    x2Receipt.positiveResultSha256 = sha256(canonicalJson({
+      id: 'X2-P01-leap-day',
+      pass: true,
+      no_throw: true,
+      schema_sha256: leap.schema_sha256,
+      serialized_bytes: leap.serialized_bytes,
+      state_status: leap.consumption_state.status,
+      decision_recursive_frozen: recursivelyFrozen(leap),
+      decision_graph_sha256: graphSha256(leap),
+    }));
   });
 
   test('returns a stable content-free INPUT rejection for null and undefined input', () => {
@@ -1522,6 +1764,7 @@ describe('exact-target pure schema and attestation validator', () => {
       ['X3-C19-state-status', (candidate) => { (candidate.consumption_state as unknown as Record<string, unknown>).status = 'consumed'; }],
     ];
     expect(callerCases).toHaveLength(19);
+    const callerResults: Record<string, unknown>[] = [];
 
     for (const [id, mutate] of callerCases) {
       const candidate = input();
@@ -1532,13 +1775,20 @@ describe('exact-target pure schema and attestation validator', () => {
       expect(result.consumption_state, id).not.toBe(callerState);
       expect(result.normalized_rows, id).not.toBe(candidate.rows);
       const baseline = graphSha256(result);
-      expect(Object.isFrozen(candidate), id).toBe(false);
-      expect(Object.isFrozen(candidate.rows), id).toBe(false);
-      expect(Object.isFrozen(candidate.attestation), id).toBe(false);
-      expect(Object.isFrozen(candidate.expected_bindings), id).toBe(false);
-      expect(Object.isFrozen(candidate.consumption_state), id).toBe(false);
+      const callerReferences = objectReferences(candidate);
+      const returnedReferences = objectReferences(result);
+      const inputAliasCount = [...returnedReferences].filter((reference) =>
+        callerReferences.has(reference),
+      ).length;
+      const callerObjectFrozenCount = [...callerReferences].filter((reference) =>
+        Object.isFrozen(reference),
+      ).length;
+      expect(inputAliasCount, id).toBe(0);
+      expect(callerObjectFrozenCount, id).toBe(0);
+      expect(recursivelyFrozen(result), id).toBe(true);
       mutate(candidate);
-      expect(graphSha256(result), id).toBe(baseline);
+      const after = graphSha256(result);
+      expect(after, id).toBe(baseline);
       expect(result.normalized_rows.map((row) => row.column_name), id).toEqual(
         EXACT_TARGET_SCHEMA_ROWS.map((row) => row.column_name),
       );
@@ -1546,9 +1796,24 @@ describe('exact-target pure schema and attestation validator', () => {
       expect(sha256(result.serialization), id).toBe(DIGEST);
       expect(result.schema_sha256, id).toBe(DIGEST);
       expect(result.consumption_state, id).toEqual({ key: GUARDIAN, status: 'consumed' });
+      callerResults.push({
+        id,
+        pass: true,
+        input_alias_count: inputAliasCount,
+        caller_object_frozen_count: callerObjectFrozenCount,
+        returned_recursive_frozen: recursivelyFrozen(result),
+        graph_before_sha256: baseline,
+        graph_after_sha256: after,
+        graph_equal: baseline === after,
+      });
+      x3Receipt.inputAliasCount += inputAliasCount;
+      x3Receipt.callerObjectFrozenCount += callerObjectFrozenCount;
       x3Receipt.callerPasses += 1;
     }
     expect(x3Receipt.callerPasses).toBe(19);
+    expect(x3Receipt.inputAliasCount).toBe(0);
+    expect(x3Receipt.callerObjectFrozenCount).toBe(0);
+    x3Receipt.callerResultsSha256 = sha256(canonicalJson(callerResults));
   });
 
   test('X3 proves the exact 209 accepted-output mutations against full graph hashes', () => {
@@ -1557,6 +1822,7 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.reason_code);
     expect(recursivelyFrozen(result)).toBe(true);
+    x3Receipt.recursiveFrozen = recursivelyFrozen(result);
     expect(result.consumption_state).not.toBe(candidate.consumption_state);
     expect(result.normalized_rows).not.toBe(candidate.rows);
 
@@ -1608,16 +1874,32 @@ describe('exact-target pure schema and attestation validator', () => {
         graph_after_sha256: after,
         baseline_graph_sha256: baseline,
       });
+      if (fixture.aliasDerivation !== null) {
+        x3Receipt.stateAliasPasses += Number(pass);
+      }
+      if (/^X3-O20[5-9]-/.test(fixture.id)) {
+        x3Receipt.returnedStateContainerPasses += Number(pass);
+      }
+      if (/^X3-O00[1-3]-/.test(fixture.id)) {
+        x3Receipt.exactDecisionPropertyPasses += Number(pass);
+      }
+      if (fixture.reflectFalse) {
+        x3Receipt.reflectFalsePasses += Number(pass);
+      }
     }
     expect(x3Receipt.outputPasses).toBe(209);
     expect(x3Receipt.graphEqual).toBe(209);
     expect(x3Receipt.reflectFalse).toBe(2);
+    expect(x3Receipt.reflectFalsePasses).toBe(2);
+    expect(x3Receipt.stateAliasPasses).toBe(10);
+    expect(x3Receipt.returnedStateContainerPasses).toBe(5);
+    expect(x3Receipt.exactDecisionPropertyPasses).toBe(3);
     expect(result.ok).toBe(true);
     expect(result.serialized_bytes).toBe(1527);
     expect(result.scope_limit).toBe(EXACT_TARGET_ATTESTATION_SCOPE_LIMIT);
     expect(result.schema_sha256).toBe(DIGEST);
     expect(result.consumption_state).toEqual({ key: GUARDIAN, status: 'consumed' });
-    x3Receipt.mutationResultsSha256 = sha256(JSON.stringify(mutationResults));
+    x3Receipt.mutationResultsSha256 = sha256(canonicalJson(mutationResults));
   });
 
   test('rejects a threaded consumed state without mutating it', () => {
@@ -1667,7 +1949,11 @@ describe('exact-target pure schema and attestation validator', () => {
 
   test('uses STATE only for a structurally valid expected-key mismatch', () => {
     const mismatched = { key: 'c'.repeat(64), status: 'unused' as const };
-    const result = validate(input({ consumption_state: mismatched }));
+    let result: ReturnType<typeof validateExactTargetSchema> | undefined;
+    expect(() => {
+      result = validate(input({ consumption_state: mismatched }));
+    }, 'STATE-X1').not.toThrow();
+    if (result === undefined) throw new Error('missing STATE-X1 result');
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error('expected state rejection');
     expect(result.reason_code).toBe('SCHEMA_ATTESTATION_STATE_REJECTED');
@@ -1675,39 +1961,121 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(result.consumption_state).toEqual(mismatched);
     expect(result.consumption_state).not.toBe(mismatched);
     expect(recursivelyFrozen(result)).toBe(true);
+    stateReceipt.id = 'STATE-X1';
+    stateReceipt.reason = result.reason_code;
+    stateReceipt.family = result.reason_family;
+    stateReceipt.recursiveFrozen = recursivelyFrozen(result);
+    stateReceipt.stateNonaliased = result.consumption_state !== mismatched;
+    stateReceipt.noThrow = true;
+    stateReceipt.decisionGraphSha256 = graphSha256(result);
+    stateReceipt.returnedStateGraphSha256 = graphSha256(result.consumption_state);
+    stateReceipt.resultSha256 = sha256(canonicalJson({
+      id: stateReceipt.id,
+      reason: stateReceipt.reason,
+      family: stateReceipt.family,
+      recursive_frozen: stateReceipt.recursiveFrozen,
+      state_nonaliased: stateReceipt.stateNonaliased,
+      no_throw: stateReceipt.noThrow,
+      decision_graph_sha256: stateReceipt.decisionGraphSha256,
+      returned_state_graph_sha256: stateReceipt.returnedStateGraphSha256,
+    }));
   });
 
   test('covers all 22 reasons and emits the exact Order-1 evidence summary', () => {
-    mutationReasons.add('SCHEMA_ATTESTATION_TIMESTAMP_REJECTED');
-    mutationReasons.add('SCHEMA_ATTESTATION_STATE_REJECTED');
-    mutationReasons.add('LIVE_SCHEMA_INPUT_REJECTED');
+    const parentReasons = [...mutationReasons].sort();
+    const x2Reasons = [...x2Receipt.reasons].sort();
+    const x1Reasons = [...x1Receipt.reasons].sort();
+    expect(parentReasons).toHaveLength(19);
+    expect(x2Reasons).toEqual(['SCHEMA_ATTESTATION_TIMESTAMP_REJECTED']);
+    expect(stateReceipt.reason).toBe('SCHEMA_ATTESTATION_STATE_REJECTED');
+    expect(x1Reasons).toEqual(['LIVE_SCHEMA_INPUT_REJECTED']);
+    const fixtureFlowReasons = new Set<ExactTargetSchemaReason>([
+      ...parentReasons,
+      ...x2Reasons,
+      stateReceipt.reason as ExactTargetSchemaReason,
+      ...x1Reasons,
+    ]);
     const allReasons = Object.keys(
       EXACT_TARGET_SCHEMA_REASON_FAMILIES,
     ).sort() as ExactTargetSchemaReason[];
     expect(allReasons).toHaveLength(22);
-    expect([...mutationReasons].sort()).toEqual(allReasons);
+    expect([...fixtureFlowReasons].sort()).toEqual(allReasons);
     expect(mutationIds.size).toBe(199);
     expect(
       Object.values(mutationHistogram).reduce((sum, count) => sum + count, 0),
     ).toBe(199);
+    expect(parentMutationResults).toHaveLength(199);
+    expect(parentPositiveResults).toHaveLength(4);
+
+    const parentIds = [...mutationIds].sort();
+    const parentIdSha256 = sha256(`${parentIds.join('\n')}\n`);
+    expect(parentIdSha256).toBe(
+      'ac867d7b81211494d1551eb9ebcfa784f95531485886f177d1d1bec3c5620883',
+    );
+    const parentResultSha256 = sha256(canonicalJson(parentMutationResults));
+    const parentGraphSha256 = sha256(canonicalJson(
+      parentMutationResults.map(({ id, decision_graph_sha256 }) => ({
+        id,
+        decision_graph_sha256,
+      })),
+    ));
+    const parentReasonSetSha256 = sha256(canonicalJson(parentReasons));
+    const parentPositiveResultSha256 = sha256(canonicalJson(parentPositiveResults));
+    const fixtureFlowReasonEvidenceSha256 = sha256(canonicalJson({
+      parent_ledger: parentReasons,
+      timestamp: x2Reasons,
+      state: [stateReceipt.reason],
+      input: x1Reasons,
+    }));
 
     console.log(
       JSON.stringify({
-        schema: 'gbrain.exact-target-order1-pure-test-receipt.v1',
+        schema: 'gbrain.exact-target-order1-pure-test-receipt.v2',
+        focused_command_argv: FOCUSED_COMMAND_ARGV,
+        source_test_authority_only: true,
+        committed_focused_receipt_authority: 'runtime_proof_only',
+        order1_parent_design_sha256: ORDER1_PARENT_DESIGN_SHA256,
+        order1_gap_map_sha256: ORDER1_GAP_MAP_SHA256,
+        order1_external_gates_v7_historical_sha256:
+          ORDER1_EXTERNAL_GATES_V7_HISTORICAL_SHA256,
+        order1_external_gates_v8_controlling_sha256:
+          ORDER1_EXTERNAL_GATES_V8_CONTROLLING_SHA256,
+        order1_controlling_checklist_v4_sha256: ORDER1_CHECKLIST_V4_SHA256,
         schema_rows: EXACT_TARGET_SCHEMA_ROWS.length,
         serialized_bytes: EXACT_TARGET_SCHEMA_SERIALIZED_BYTES,
         schema_sha256: DIGEST,
         query_bytes: EXACT_TARGET_SCHEMA_QUERY_BYTES,
         query_sha256: EXACT_TARGET_SCHEMA_QUERY_SHA256,
         positive_permutations: 4,
-        schema_mutations_exact: mutationIds.size,
-        unique_mutation_ids: mutationIds.size,
-        histogram: mutationHistogram,
-        reason_codes_covered: mutationReasons.size,
+        parent_positive_permutation_result_sha256: parentPositiveResultSha256,
+        parent_ledger_instance_count: mutationIds.size,
+        parent_ledger_unique_id_count: mutationIds.size,
+        parent_ledger_id_sha256: parentIdSha256,
+        parent_ledger_result_sha256: parentResultSha256,
+        parent_ledger_graph_sha256: parentGraphSha256,
+        parent_ledger_histogram: mutationHistogram,
+        parent_ledger_reason_set: parentReasons,
+        parent_ledger_reason_set_sha256: parentReasonSetSha256,
+        reason_codes_covered: fixtureFlowReasons.size,
         parent_ledger_used_reasons: 19,
-        outside_parent_reasons: 3,
+        pre_x1_outside_parent_reason_count: 2,
+        x1_external_reason_count: 1,
+        total_validator_reason_count: 22,
+        fixture_flow_reason_evidence_sha256: fixtureFlowReasonEvidenceSha256,
+        timestamp_reason_fixture_owner: 'X2',
+        state_reason_fixture_owner: stateReceipt.id,
+        input_reason_fixture_owner: 'X1',
         threaded_unused_to_consumed: true,
         stale_unused_replay_limitation_proved: true,
+        state_fixture_id: stateReceipt.id,
+        state_reason: stateReceipt.reason,
+        state_reason_family: stateReceipt.family,
+        state_decision_recursive_frozen: stateReceipt.recursiveFrozen,
+        state_returned_state_nonaliased: stateReceipt.stateNonaliased,
+        state_no_throw: stateReceipt.noThrow,
+        state_result_sha256: stateReceipt.resultSha256,
+        state_decision_graph_sha256: stateReceipt.decisionGraphSha256,
+        state_returned_state_graph_sha256: stateReceipt.returnedStateGraphSha256,
         x1_case_count: 187,
         x1_pass_count: 187,
         x1_fail_count: 0,
@@ -1715,30 +2083,44 @@ describe('exact-target pure schema and attestation validator', () => {
         x1_throw_count: 0,
         x1_reason: 'LIVE_SCHEMA_INPUT_REJECTED',
         x1_reason_family: 'LIVE_SCHEMA_INPUT_REJECTED',
+        x1_reason_count: x1Reasons.length,
         x1_case_ids_sha256:
           '4a23eccebb8f56d5f25e50d9da7ac196007b7fda5516e8459724a780de23cb22',
         x1_case_results_sha256: x1Receipt.caseResultsSha256,
+        x1_decisions_recursive_frozen: x1Receipt.decisionsRecursiveFrozen,
+        x1_decisions_nonaliased: x1Receipt.decisionsNonaliased,
         x1_frozen_state_case_count: x1Receipt.frozenStates,
         x1_null_state_case_count: x1Receipt.nullStates,
         x1_exotic_object_case_count: 25,
         x1_non_enumerable_case_count: 5,
+        x1_decision_mutation_count: 748,
+        x1_decision_mutation_pass_count: x1Receipt.decisionMutationPasses,
+        x1_state_mutation_count: 917,
+        x1_state_mutation_pass_count: x1Receipt.stateMutationPasses,
         x1_total_mutation_count: 1665,
+        x1_unique_mutation_id_count: 1665,
         x1_total_mutation_pass_count: x1Receipt.mutationPasses,
         x1_total_mutation_fail_count: 0,
         x1_total_mutation_error_count: 0,
         x1_recursive_graph_unchanged_count: x1Receipt.mutationPasses,
+        x1_graph_before_after_equal_count: x1Receipt.graphEqual,
+        x1_graph_before_after_mismatch_count: 0,
         x1_mutation_ids_sha256:
           'f869fa936c0f2a2d2ab457a6b6f187acc6abf8fff84f6dd9a538bce1e9693709',
+        x1_operation_catalog_sha256: x1Receipt.catalogSha256,
         x1_mutation_results_sha256: x1Receipt.mutationResultsSha256,
         x2_invalid_count: 12,
         x2_invalid_pass_count: x2Receipt.invalidPasses,
-        x2_timestamp_reason_count: x2Receipt.invalidPasses,
+        x2_timestamp_reason_count: x2Receipt.reasonObservations,
         x2_positive_count: 1,
         x2_positive_pass_count: x2Receipt.positivePasses,
         x2_case_ids_sha256:
           '702a189b342a744640ccf014610ec22c337dd504030f241ed9cf9f9bce95351f',
+        x2_result_sha256: x2Receipt.resultSha256,
+        x2_positive_result_sha256: x2Receipt.positiveResultSha256,
         x3_caller_alias_case_count: 19,
         x3_caller_alias_pass_count: x3Receipt.callerPasses,
+        x3_caller_result_sha256: x3Receipt.callerResultsSha256,
         x3_output_mutation_case_count: 209,
         x3_output_mutation_pass_count: x3Receipt.outputPasses,
         x3_output_mutation_ids_sha256:
@@ -1747,16 +2129,37 @@ describe('exact-target pure schema and attestation validator', () => {
         x3_mutation_results_sha256: x3Receipt.mutationResultsSha256,
         x3_full_graph_before_after_equal_count: x3Receipt.graphEqual,
         x3_full_graph_before_after_mismatch_count: 0,
+        x3_recursive_frozen: x3Receipt.recursiveFrozen,
+        x3_input_alias_count: x3Receipt.inputAliasCount,
+        x3_caller_object_frozen_count: x3Receipt.callerObjectFrozenCount,
         x3_exact_state_property: 'decision.consumption_state',
         x3_exact_digest_property: 'decision.schema_sha256',
         x3_alias_derived_from_exact_state_property_count: 10,
+        x3_state_alias_mutation_count: 10,
+        x3_state_alias_mutation_pass_count: x3Receipt.stateAliasPasses,
         x3_returned_state_container_mutation_count: 5,
+        x3_returned_state_container_mutation_pass_count:
+          x3Receipt.returnedStateContainerPasses,
         x3_reflect_false_case_count: x3Receipt.reflectFalse,
+        x3_reflect_false_pass_count: x3Receipt.reflectFalsePasses,
         x3_primitive_prototype_case_count: 0,
         x3_missing_property_target_count: 0,
         x3_exact_decision_property_mutation_count: 3,
+        x3_exact_decision_property_mutation_pass_count:
+          x3Receipt.exactDecisionPropertyPasses,
         x3_abstract_local_target_count: 0,
-        external_effect_authority: 'external_order0_import_runtime_guard_only',
+        external_effect_authority: 'external_order1_import_runtime_guard_only',
+        package_authority: false,
+        runtime_authority: false,
+        database_authority: false,
+        queue_authority: false,
+        job_authority: false,
+        claim_authority: false,
+        handler_authority: false,
+        model_authority: false,
+        session_authority: false,
+        f4b_authority: false,
+        lane_d_authority: false,
       }),
     );
   });
