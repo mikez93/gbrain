@@ -823,6 +823,8 @@ export interface SearchResult {
   updated_at?: string | null;
   /** Complete, uncapped fact validity evidence for trusted owner routers. */
   fact_authority_evidence?: import('./facts/page-bindings.ts').FactAuthorityEvidence;
+  /** Provider-free lexical evidence consumed by the authenticated fleet router. */
+  retrieval_evidence?: import('./search/f9-relevance.ts').F9RetrievalEvidence;
   /** RFC 5322 Message-ID projected from allowlisted email frontmatter. */
   message_id?: string;
   /** Gmail thread id projected from allowlisted email frontmatter. */

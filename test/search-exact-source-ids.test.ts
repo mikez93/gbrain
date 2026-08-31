@@ -227,12 +227,18 @@ describe('search source_ids trusted-local contract', () => {
       query: 'fixture',
     }) as SearchResult[];
     expect((fleetResults[0] as SearchResult & { fact_bindings?: unknown[] }).fact_bindings).toHaveLength(1);
+    expect(fleetResults[0].retrieval_evidence).toMatchObject({
+      version: 'f9-item-evidence-v1',
+      query_token_count: 1,
+      matched_distinct_token_count: 1,
+    });
 
     const ordinary = context(true, 'ordinary-client');
     const ordinaryResults = await operationsByName.search.handler(ordinary.ctx, {
       query: 'fixture',
     }) as SearchResult[];
     expect((ordinaryResults[0] as SearchResult & { fact_bindings?: unknown[] }).fact_bindings).toBeUndefined();
+    expect(ordinaryResults[0].retrieval_evidence).toBeUndefined();
 
     const selfNamedDcr = context(
       true,
@@ -243,5 +249,6 @@ describe('search source_ids trusted-local contract', () => {
       query: 'fixture',
     }) as SearchResult[];
     expect((dcrResults[0] as SearchResult & { fact_bindings?: unknown[] }).fact_bindings).toBeUndefined();
+    expect(dcrResults[0].retrieval_evidence).toBeUndefined();
   });
 });

@@ -24,6 +24,7 @@ import type { HybridSearchMeta, SearchOpts, SearchResult } from '../types.ts';
 import { isValidSourceId } from '../source-id.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
+import { stampF9RetrievalEvidence } from '../search/f9-relevance.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { stampPageDispositions } from '../disposition/search.ts';
 import { stampFactAuthorityEvidence, stampFactPageBindings } from '../facts/page-bindings.ts';
@@ -330,8 +331,10 @@ async function resolveSnippetCap(ctx: OperationContext, p: Record<string, unknow
 async function stampOwnerFactMetadata(
   ctx: OperationContext,
   results: SearchResult[],
+  queryText?: string,
 ): Promise<void> {
   const authorized = canReadFactBindings(ctx);
+  if (authorized && queryText !== undefined) stampF9RetrievalEvidence(queryText, results);
   await Promise.all([
     stampFactPageBindings(ctx.engine, results, { authorized }),
     stampFactAuthorityEvidence(ctx.engine, results, {
@@ -423,7 +426,7 @@ const search: Operation = {
       await stampUnverifiedExtractions(ctx.engine, results);
       await stampPageDispositions(ctx.engine, results);
       await stampPageUpdatedAt(ctx, results);
-      await stampOwnerFactMetadata(ctx, results);
+      await stampOwnerFactMetadata(ctx, results, queryText);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false, fallbackMeta);
       ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, fallbackMeta, { conceptHint: true }));
@@ -456,7 +459,7 @@ const search: Operation = {
     });
     stampDeepResearchIds(results);
     await stampPageUpdatedAt(ctx, results);
-    await stampOwnerFactMetadata(ctx, results);
+    await stampOwnerFactMetadata(ctx, results, queryText);
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
@@ -801,7 +804,7 @@ const query: Operation = {
       }
     }
     await stampPageUpdatedAt(ctx, results);
-    await stampOwnerFactMetadata(ctx, results);
+    await stampOwnerFactMetadata(ctx, results, queryText);
     const latency_ms = Date.now() - startedAt;
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
