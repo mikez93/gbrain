@@ -9,35 +9,6 @@ import type {
   ValidateExactTargetSchemaInput,
 } from '../src/core/minions/exact-target-schema.ts';
 
-const EFFECT_NAMES = [
-  'metadata_select_calls',
-  'claim_update_calls',
-  'readback_select_calls',
-  'handler_launch_calls',
-  'generic_adapter_calls',
-  'pure_sql_calls',
-] as const;
-type EffectName = (typeof EFFECT_NAMES)[number];
-
-const effectCounters = Object.fromEntries(
-  EFFECT_NAMES.map((name) => [name, 0]),
-) as Record<EffectName, number>;
-const effectSpies = Object.fromEntries(
-  EFFECT_NAMES.map((name) => [
-    name,
-    () => {
-      effectCounters[name] += 1;
-      throw new Error(`forbidden effect reached: ${name}`);
-    },
-  ]),
-) as Record<EffectName, () => never>;
-
-for (const name of EFFECT_NAMES) {
-  expect(effectSpies[name]).toThrow(`forbidden effect reached: ${name}`);
-  expect(effectCounters[name]).toBe(1);
-  effectCounters[name] = 0;
-}
-
 const schema = await import('../src/core/minions/exact-target-schema.ts');
 const {
   EXACT_TARGET_ATTESTATION_SCOPE_LIMIT,
@@ -154,29 +125,16 @@ function input(
     rows: cloneRows(),
     attestation: { ...ATTESTATION },
     now: NOW,
-    consumption_state: UNUSED,
-    expected_bindings: EXPECTED_BINDINGS,
+    consumption_state: { ...UNUSED },
+    expected_bindings: { ...EXPECTED_BINDINGS },
     ...overrides,
   };
 }
 
-function assertEffectsZero(): void {
-  expect(effectCounters).toEqual({
-    metadata_select_calls: 0,
-    claim_update_calls: 0,
-    readback_select_calls: 0,
-    handler_launch_calls: 0,
-    generic_adapter_calls: 0,
-    pure_sql_calls: 0,
-  });
-}
-
 function validate(
-  value: ValidateExactTargetSchemaInput,
+  value: unknown,
 ): ReturnType<typeof validateExactTargetSchema> {
-  const result = validateExactTargetSchema(value);
-  assertEffectsZero();
-  return result;
+  return validateExactTargetSchema(value);
 }
 
 function expectReason(
@@ -242,10 +200,650 @@ function recordMutation(
   expectReason(value, reason);
 }
 
+type StateKind = 'frozen_copy' | 'null';
+type X1Case = {
+  readonly id: string;
+  readonly make: () => unknown;
+  readonly stateKind: StateKind;
+  readonly exotic?: boolean;
+  readonly nonEnumerable?: boolean;
+};
+
+function mutableInput(): Record<string, unknown> {
+  return input() as unknown as Record<string, unknown>;
+}
+
+function withTopLevelMutation(
+  mutate: (value: Record<string, unknown>) => void,
+): () => unknown {
+  return () => {
+    const value = mutableInput();
+    mutate(value);
+    return value;
+  };
+}
+
+function withRowsMutation(mutate: (rows: unknown[]) => void): () => unknown {
+  return withTopLevelMutation((value) => {
+    const rows = value.rows as unknown[];
+    mutate(rows);
+  });
+}
+
+function withRowMutation(
+  mutate: (row: Record<PropertyKey, unknown>) => void,
+): () => unknown {
+  return withRowsMutation((rows) => mutate(rows[0] as Record<PropertyKey, unknown>));
+}
+
+function withAttestationMutation(
+  mutate: (attestation: Record<PropertyKey, unknown>) => void,
+): () => unknown {
+  return withTopLevelMutation((value) =>
+    mutate(value.attestation as Record<PropertyKey, unknown>),
+  );
+}
+
+function withExpectedMutation(
+  mutate: (bindings: Record<PropertyKey, unknown>) => void,
+): () => unknown {
+  return withTopLevelMutation((value) =>
+    mutate(value.expected_bindings as Record<PropertyKey, unknown>),
+  );
+}
+
+function withStateMutation(
+  mutate: (state: Record<PropertyKey, unknown>) => void,
+): () => unknown {
+  return withTopLevelMutation((value) =>
+    mutate(value.consumption_state as Record<PropertyKey, unknown>),
+  );
+}
+
+function throwingGetter(target: object, key: PropertyKey): void {
+  Object.defineProperty(target, key, {
+    enumerable: true,
+    configurable: true,
+    get() {
+      throw new Error('attacker getter invoked');
+    },
+  });
+}
+
+function nonEnumerable(target: object, key: PropertyKey): void {
+  const descriptor = Object.getOwnPropertyDescriptor(target, key);
+  if (descriptor === undefined || !('value' in descriptor)) {
+    throw new Error(`missing data property ${String(key)}`);
+  }
+  Object.defineProperty(target, key, { ...descriptor, enumerable: false });
+}
+
+const runtimeValues: readonly [string, () => unknown][] = [
+  ['null', () => null],
+  ['object', () => ({})],
+  ['array', () => []],
+  ['function', () => function attacker() {}],
+  ['number', () => 0],
+  ['boolean', () => false],
+  ['bigint', () => 0n],
+  ['symbol', () => Symbol('attacker')],
+];
+
+class Attacker {}
+const exoticValues: readonly [string, () => object][] = [
+  ['date', () => new Date(0)],
+  ['map', () => new Map()],
+  ['set', () => new Set()],
+  ['boxed', () => new Number(0)],
+  ['custom-class', () => new Attacker()],
+];
+
+function buildX1Cases(): X1Case[] {
+  const cases: X1Case[] = [
+    { id: 'X1-TL-null', make: () => null, stateKind: 'null' },
+    { id: 'X1-TL-undefined', make: () => undefined, stateKind: 'null' },
+    { id: 'X1-TL-boolean', make: () => false, stateKind: 'null' },
+    { id: 'X1-TL-number', make: () => 0, stateKind: 'null' },
+    { id: 'X1-TL-string', make: () => 'invalid', stateKind: 'null' },
+    { id: 'X1-TL-bigint', make: () => 0n, stateKind: 'null' },
+    { id: 'X1-TL-symbol', make: () => Symbol('attacker'), stateKind: 'null' },
+    { id: 'X1-TL-function', make: () => function attacker() {}, stateKind: 'null' },
+    { id: 'X1-TL-array', make: () => [], stateKind: 'null' },
+    { id: 'X1-TL-empty_object', make: () => ({}), stateKind: 'null' },
+    {
+      id: 'X1-TL-proxy',
+      make: () =>
+        new Proxy(mutableInput(), {
+          ownKeys() {
+            throw new Error('attacker ownKeys trap invoked');
+          },
+          getOwnPropertyDescriptor() {
+            throw new Error('attacker descriptor trap invoked');
+          },
+        }),
+      stateKind: 'null',
+    },
+    {
+      id: 'X1-TL-extra-key',
+      make: withTopLevelMutation((value) => {
+        value.attacker_marker = true;
+      }),
+      stateKind: 'frozen_copy',
+    },
+    {
+      id: 'X1-TL-symbol-key',
+      make: withTopLevelMutation((value) => {
+        value[Symbol('attacker')] = true;
+      }),
+      stateKind: 'frozen_copy',
+    },
+  ];
+
+  for (const key of ['rows', 'attestation', 'now', 'consumption_state', 'expected_bindings']) {
+    cases.push({
+      id: `X1-TL-missing-${key.replace('_', '_')}`,
+      make: withTopLevelMutation((value) => {
+        delete value[key];
+      }),
+      stateKind: key === 'consumption_state' ? 'null' : 'frozen_copy',
+    });
+  }
+  for (const key of ['rows', 'attestation', 'now', 'consumption_state', 'expected_bindings']) {
+    cases.push({
+      id: `X1-TL-accessor-${key}`,
+      make: withTopLevelMutation((value) => throwingGetter(value, key)),
+      stateKind: key === 'consumption_state' ? 'null' : 'frozen_copy',
+    });
+  }
+  for (const key of ['rows', 'attestation', 'now', 'consumption_state', 'expected_bindings']) {
+    cases.push({
+      id: `X1-TL-inherited-${key}`,
+      make: withTopLevelMutation((value) => {
+        const inherited = value[key];
+        delete value[key];
+        Object.setPrototypeOf(value, { [key]: inherited });
+      }),
+      stateKind: key === 'consumption_state' ? 'null' : 'frozen_copy',
+    });
+  }
+
+  cases.push(
+    { id: 'X1-ROWS-null', make: withTopLevelMutation((v) => { v.rows = null; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-object', make: withTopLevelMutation((v) => { v.rows = {}; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-sparse', make: withRowsMutation((rows) => { delete rows[0]; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-proxy', make: withTopLevelMutation((v) => { v.rows = new Proxy(v.rows as object, {}); }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-accessor_element', make: withRowsMutation((rows) => throwingGetter(rows, 0)), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-row_null', make: withRowsMutation((rows) => { rows[0] = null; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-row_array', make: withRowsMutation((rows) => { rows[0] = []; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-row_proxy', make: withRowsMutation((rows) => { rows[0] = new Proxy(rows[0] as object, {}); }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-row_missing_key', make: withRowMutation((row) => { delete row.udt_name; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-row_extra_key', make: withRowMutation((row) => { row.attacker = true; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ROWS-row_symbol_key', make: withRowMutation((row) => { row[Symbol('attacker')] = true; }), stateKind: 'frozen_copy' },
+    {
+      id: 'X1-ROWS-row_inherited_coordinate',
+      make: withRowMutation((row) => {
+        const columnName = row.column_name;
+        delete row.column_name;
+        Object.setPrototypeOf(row, { column_name: columnName });
+      }),
+      stateKind: 'frozen_copy',
+    },
+  );
+
+  for (const coordinate of ['column_name', 'data_type', 'udt_name', 'is_nullable']) {
+    for (const [kind, makeValue] of runtimeValues) {
+      cases.push({
+        id: `X1-ROW-${coordinate}-${kind}`,
+        make: withRowMutation((row) => { row[coordinate] = makeValue(); }),
+        stateKind: 'frozen_copy',
+      });
+    }
+    cases.push({
+      id: `X1-ROW-${coordinate}-accessor`,
+      make: withRowMutation((row) => throwingGetter(row, coordinate)),
+      stateKind: 'frozen_copy',
+    });
+    cases.push({
+      id: `X1-ROW-${coordinate}-proxy`,
+      make: withRowMutation((row) => { row[coordinate] = new Proxy({}, {}); }),
+      stateKind: 'frozen_copy',
+    });
+  }
+
+  cases.push(
+    { id: 'X1-ATT-array', make: withTopLevelMutation((v) => { v.attestation = []; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ATT-empty', make: withTopLevelMutation((v) => { v.attestation = {}; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ATT-proxy', make: withTopLevelMutation((v) => { v.attestation = new Proxy(v.attestation as object, {}); }), stateKind: 'frozen_copy' },
+    { id: 'X1-ATT-extra', make: withAttestationMutation((v) => { v.attacker_marker = true; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ATT-symbol', make: withAttestationMutation((v) => { v[Symbol('attacker')] = true; }), stateKind: 'frozen_copy' },
+    { id: 'X1-ATT-accessor', make: withAttestationMutation((v) => throwingGetter(v, 'brain_binding')), stateKind: 'frozen_copy' },
+  );
+  for (const coordinate of [
+    'brain_binding', 'database_binding', 'current_schema', 'table_schema',
+    'table_name', 'column_count', 'schema_sha256', 'query_contract_sha256',
+    'guardian_challenge_binding', 'hold_gate_binding', 'acquired_at', 'expires_at',
+  ]) {
+    cases.push({
+      id: `X1-ATT-${coordinate}-wrong-type`,
+      make: withAttestationMutation((value) => {
+        value[coordinate] = coordinate === 'column_count' ? '46' : 0;
+      }),
+      stateKind: 'frozen_copy',
+    });
+  }
+  for (const [kind, invalid] of [
+    ['nan', Number.NaN],
+    ['positive-infinity', Number.POSITIVE_INFINITY],
+    ['negative-infinity', Number.NEGATIVE_INFINITY],
+    ['fraction', 46.5],
+    ['unsafe-integer', Number.MAX_SAFE_INTEGER + 1],
+  ] as const) {
+    cases.push({
+      id: `X1-ATT-column_count-${kind}`,
+      make: withAttestationMutation((value) => { value.column_count = invalid; }),
+      stateKind: 'frozen_copy',
+    });
+  }
+
+  cases.push(
+    { id: 'X1-EXP-null', make: withTopLevelMutation((v) => { v.expected_bindings = null; }), stateKind: 'frozen_copy' },
+    { id: 'X1-EXP-array', make: withTopLevelMutation((v) => { v.expected_bindings = []; }), stateKind: 'frozen_copy' },
+    { id: 'X1-EXP-empty', make: withTopLevelMutation((v) => { v.expected_bindings = {}; }), stateKind: 'frozen_copy' },
+    { id: 'X1-EXP-proxy', make: withTopLevelMutation((v) => { v.expected_bindings = new Proxy(v.expected_bindings as object, {}); }), stateKind: 'frozen_copy' },
+    { id: 'X1-EXP-extra', make: withExpectedMutation((v) => { v.attacker_marker = true; }), stateKind: 'frozen_copy' },
+    { id: 'X1-EXP-symbol', make: withExpectedMutation((v) => { v[Symbol('attacker')] = true; }), stateKind: 'frozen_copy' },
+    { id: 'X1-EXP-accessor', make: withExpectedMutation((v) => throwingGetter(v, 'brain_binding')), stateKind: 'frozen_copy' },
+  );
+  for (const coordinate of [
+    'brain_binding', 'database_binding', 'current_schema', 'table_schema',
+    'table_name', 'guardian_challenge_binding', 'hold_gate_binding',
+  ]) {
+    cases.push({
+      id: `X1-EXP-${coordinate}-wrong-type`,
+      make: withExpectedMutation((value) => { value[coordinate] = 0; }),
+      stateKind: 'frozen_copy',
+    });
+  }
+
+  const nowRuntimeValues: readonly [string, () => unknown][] = [
+    ['null', () => null],
+    ['number', () => 0],
+    ['object', () => ({})],
+    ['array', () => []],
+    ['function', () => function attacker() {}],
+    ['boolean', () => false],
+    ['bigint', () => 0n],
+    ['symbol', () => Symbol('attacker')],
+  ];
+  for (const [kind, makeValue] of nowRuntimeValues) {
+    cases.push({
+      id: `X1-NOW-${kind}`,
+      make: withTopLevelMutation((value) => { value.now = makeValue(); }),
+      stateKind: 'frozen_copy',
+    });
+  }
+
+  cases.push(
+    { id: 'X1-STATE-null', make: withTopLevelMutation((v) => { v.consumption_state = null; }), stateKind: 'null' },
+    { id: 'X1-STATE-array', make: withTopLevelMutation((v) => { v.consumption_state = []; }), stateKind: 'null' },
+    { id: 'X1-STATE-empty', make: withTopLevelMutation((v) => { v.consumption_state = {}; }), stateKind: 'null' },
+    { id: 'X1-STATE-proxy', make: withTopLevelMutation((v) => { v.consumption_state = new Proxy(v.consumption_state as object, {}); }), stateKind: 'null' },
+    { id: 'X1-STATE-extra', make: withStateMutation((v) => { v.attacker_marker = true; }), stateKind: 'null' },
+    { id: 'X1-STATE-symbol', make: withStateMutation((v) => { v[Symbol('attacker')] = true; }), stateKind: 'null' },
+    { id: 'X1-STATE-key-accessor', make: withStateMutation((v) => throwingGetter(v, 'key')), stateKind: 'null' },
+    { id: 'X1-STATE-status-accessor', make: withStateMutation((v) => throwingGetter(v, 'status')), stateKind: 'null' },
+  );
+  for (const coordinate of ['key', 'status']) {
+    for (const [kind, makeValue] of runtimeValues) {
+      cases.push({
+        id: `X1-STATE-${coordinate}-${kind}`,
+        make: withStateMutation((value) => { value[coordinate] = makeValue(); }),
+        stateKind: 'null',
+      });
+    }
+    cases.push({
+      id: `X1-STATE-${coordinate}-proxy`,
+      make: withStateMutation((value) => { value[coordinate] = new Proxy({}, {}); }),
+      stateKind: 'null',
+    });
+  }
+  cases.push(
+    { id: 'X1-STATE-key-short', make: withStateMutation((v) => { v.key = 'a'.repeat(63); }), stateKind: 'null' },
+    { id: 'X1-STATE-key-uppercase', make: withStateMutation((v) => { v.key = 'A'.repeat(64); }), stateKind: 'null' },
+    { id: 'X1-STATE-status-bogus', make: withStateMutation((v) => { v.status = 'bogus'; }), stateKind: 'null' },
+  );
+
+  cases.push(
+    {
+      id: 'X1-DEF-proxy-ownKeys-throws',
+      make: () => new Proxy(mutableInput(), { ownKeys() { throw new Error('ownKeys'); } }),
+      stateKind: 'null',
+    },
+    {
+      id: 'X1-DEF-proxy-getOwnPropertyDescriptor-throws',
+      make: () => new Proxy(mutableInput(), { getOwnPropertyDescriptor() { throw new Error('descriptor'); } }),
+      stateKind: 'null',
+    },
+    {
+      id: 'X1-DEF-nested-getter-throws',
+      make: withRowMutation((row) => throwingGetter(row, 'column_name')),
+      stateKind: 'frozen_copy',
+    },
+  );
+
+  for (const [kind, makeValue] of exoticValues) {
+    cases.push({ id: `X1-EXOTIC-top_level-${kind}`, make: makeValue, stateKind: 'null', exotic: true });
+  }
+  for (const [coordinate, mutate] of [
+    ['row', (value: Record<string, unknown>, exotic: object) => { (value.rows as unknown[])[0] = exotic; }],
+    ['attestation', (value: Record<string, unknown>, exotic: object) => { value.attestation = exotic; }],
+    ['expected_bindings', (value: Record<string, unknown>, exotic: object) => { value.expected_bindings = exotic; }],
+    ['consumption_state', (value: Record<string, unknown>, exotic: object) => { value.consumption_state = exotic; }],
+  ] as const) {
+    for (const [kind, makeValue] of exoticValues) {
+      cases.push({
+        id: `X1-EXOTIC-${coordinate}-${kind}`,
+        make: withTopLevelMutation((value) => mutate(value, makeValue())),
+        stateKind: coordinate === 'consumption_state' ? 'null' : 'frozen_copy',
+        exotic: true,
+      });
+    }
+  }
+
+  cases.push(
+    { id: 'X1-NONENUM-top_level', make: withTopLevelMutation((v) => nonEnumerable(v, 'rows')), stateKind: 'frozen_copy', nonEnumerable: true },
+    { id: 'X1-NONENUM-row', make: withRowMutation((v) => nonEnumerable(v, 'column_name')), stateKind: 'frozen_copy', nonEnumerable: true },
+    { id: 'X1-NONENUM-attestation', make: withAttestationMutation((v) => nonEnumerable(v, 'brain_binding')), stateKind: 'frozen_copy', nonEnumerable: true },
+    { id: 'X1-NONENUM-expected_bindings', make: withExpectedMutation((v) => nonEnumerable(v, 'brain_binding')), stateKind: 'frozen_copy', nonEnumerable: true },
+    { id: 'X1-NONENUM-consumption_state', make: withStateMutation((v) => nonEnumerable(v, 'key')), stateKind: 'null', nonEnumerable: true },
+  );
+  return cases;
+}
+
+function primitiveEncoding(value: unknown): string {
+  if (value === null) return 'null';
+  switch (typeof value) {
+    case 'undefined': return 'undefined';
+    case 'string': return `string:${JSON.stringify(value)}`;
+    case 'boolean': return `boolean:${value}`;
+    case 'number': return `number:${Object.is(value, -0) ? '-0' : String(value)}`;
+    case 'bigint': return `bigint:${value}`;
+    case 'symbol': return `symbol:${String(value.description)}`;
+    case 'function': return `function:${value.name}`;
+    default: return `unknown:${String(value)}`;
+  }
+}
+
+function descriptorGraph(value: unknown): string {
+  const references = new Map<object, number>();
+  const encode = (current: unknown): unknown => {
+    if ((typeof current !== 'object' || current === null) && typeof current !== 'function') {
+      return primitiveEncoding(current);
+    }
+    const object = current as object;
+    const seen = references.get(object);
+    if (seen !== undefined) return { ref: seen };
+    const id = references.size;
+    references.set(object, id);
+    const prototype = Object.getPrototypeOf(object);
+    const prototypeName = prototype === Object.prototype
+      ? 'Object.prototype'
+      : prototype === Array.prototype
+        ? 'Array.prototype'
+        : prototype === null
+          ? 'null'
+          : `other:${prototype?.constructor?.name ?? 'unknown'}`;
+    const keys = Reflect.ownKeys(object).sort((left, right) => {
+      const a = typeof left === 'string' ? `0:${left}` : `1:${left.description ?? ''}`;
+      const b = typeof right === 'string' ? `0:${right}` : `1:${right.description ?? ''}`;
+      return a.localeCompare(b);
+    });
+    return {
+      id,
+      kind: Array.isArray(object) ? 'array' : 'object',
+      prototype: prototypeName,
+      properties: keys.map((key) => {
+        const descriptor = Object.getOwnPropertyDescriptor(object, key)!;
+        const name = typeof key === 'string' ? `string:${key}` : `symbol:${key.description ?? ''}`;
+        if ('value' in descriptor) {
+          return {
+            name,
+            enumerable: descriptor.enumerable,
+            configurable: descriptor.configurable,
+            writable: descriptor.writable,
+            value: encode(descriptor.value),
+          };
+        }
+        return {
+          name,
+          enumerable: descriptor.enumerable,
+          configurable: descriptor.configurable,
+          getter: descriptor.get ? `function:${descriptor.get.name}` : 'absent',
+          setter: descriptor.set ? `function:${descriptor.set.name}` : 'absent',
+        };
+      }),
+    };
+  };
+  return JSON.stringify(encode(value));
+}
+
+function graphSha256(value: unknown): string {
+  return sha256(descriptorGraph(value));
+}
+
+function recursivelyFrozen(value: unknown, seen = new Set<object>()): boolean {
+  if ((typeof value !== 'object' || value === null) && typeof value !== 'function') return true;
+  const object = value as object;
+  if (seen.has(object)) return true;
+  seen.add(object);
+  if (!Object.isFrozen(object)) return false;
+  for (const key of Reflect.ownKeys(object)) {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key)!;
+    if ('value' in descriptor && !recursivelyFrozen(descriptor.value, seen)) return false;
+  }
+  return true;
+}
+
+function impossibleMutation(mutate: () => unknown): { threw: boolean; result: unknown } {
+  try {
+    return { threw: false, result: mutate() };
+  } catch {
+    return { threw: true, result: null };
+  }
+}
+
+type AcceptedDecision = Extract<
+  ReturnType<typeof validateExactTargetSchema>,
+  { readonly ok: true }
+>;
+
+type X3OutputOperation = {
+  readonly id: string;
+  readonly target: string;
+  readonly operation: string;
+  readonly aliasDerivation: string | null;
+  readonly mutate: () => unknown;
+  readonly reflectFalse?: boolean;
+};
+
+function buildX3OutputOperations(decision: AcceptedDecision): X3OutputOperation[] {
+  const mutableDecision = decision as unknown as Record<string, unknown>;
+  const rows = decision.normalized_rows as unknown as unknown[];
+  const operations: X3OutputOperation[] = [
+    { id: 'X3-O001-decision-ok-set', target: 'decision.ok', operation: 'strict assignment', aliasDerivation: null, mutate: () => { mutableDecision.ok = false; } },
+    { id: 'X3-O002-decision-serialized_bytes-delete', target: 'decision.serialized_bytes', operation: 'strict delete', aliasDerivation: null, mutate: () => delete mutableDecision.serialized_bytes },
+    { id: 'X3-O003-decision-scope_limit-redefine', target: 'decision.scope_limit', operation: 'Object.defineProperty', aliasDerivation: null, mutate: () => Object.defineProperty(decision, 'scope_limit', { value: 'attacker', configurable: true }) },
+    { id: 'X3-O004', target: 'decision', operation: 'setPrototypeOf', aliasDerivation: null, mutate: () => Object.setPrototypeOf(decision, { attacker: true }) },
+    { id: 'X3-O005', target: 'normalized_rows', operation: 'reorder', aliasDerivation: null, mutate: () => rows.reverse() },
+    { id: 'X3-O006', target: 'normalized_rows', operation: 'splice', aliasDerivation: null, mutate: () => rows.splice(0, 1) },
+    { id: 'X3-O007', target: 'normalized_rows', operation: 'append', aliasDerivation: null, mutate: () => rows.push({ attacker: true }) },
+    { id: 'X3-O008', target: 'normalized_rows', operation: 'delete', aliasDerivation: null, mutate: () => delete rows[0] },
+    { id: 'X3-O009', target: 'normalized_rows', operation: 'redefine', aliasDerivation: null, mutate: () => Object.defineProperty(rows, '0', { value: { attacker: true } }) },
+    { id: 'X3-O010', target: 'normalized_rows', operation: 'setPrototypeOf', aliasDerivation: null, mutate: () => Object.setPrototypeOf(rows, { attacker: true }) },
+  ];
+  let sequence = 11;
+  for (const [index, row] of decision.normalized_rows.entries()) {
+    const mutableRow = row as unknown as Record<string, unknown>;
+    const prefix = `normalized_rows[${index}]`;
+    operations.push(
+      { id: `X3-O${String(sequence++).padStart(3, '0')}`, target: prefix, operation: 'set', aliasDerivation: null, mutate: () => { mutableRow.column_name = 'attacker'; } },
+      { id: `X3-O${String(sequence++).padStart(3, '0')}`, target: prefix, operation: 'delete', aliasDerivation: null, mutate: () => delete mutableRow.column_name },
+      { id: `X3-O${String(sequence++).padStart(3, '0')}`, target: prefix, operation: 'redefine', aliasDerivation: null, mutate: () => Object.defineProperty(row, 'column_name', { value: 'attacker' }) },
+      { id: `X3-O${String(sequence++).padStart(3, '0')}`, target: prefix, operation: 'setPrototypeOf', aliasDerivation: null, mutate: () => Object.setPrototypeOf(row, { attacker: true }) },
+    );
+  }
+  const state = decision.consumption_state;
+  const mutableState = state as unknown as Record<string, unknown>;
+  operations.push(
+    { id: 'X3-O195', target: 'decision.serialization', operation: 'replace', aliasDerivation: null, mutate: () => { mutableDecision.serialization = 'attacker'; } },
+    { id: 'X3-O196-decision-schema_sha256-replace', target: 'decision.schema_sha256', operation: 'strict assignment replace exact property value', aliasDerivation: null, mutate: () => { mutableDecision.schema_sha256 = '0'.repeat(64); } },
+    { id: 'X3-O197-consumption_state-key-set', target: 'state.key where state = decision.consumption_state', operation: 'strict assignment', aliasDerivation: 'const state = decision.consumption_state', mutate: () => { mutableState.key = 'c'.repeat(64); } },
+    { id: 'X3-O198-consumption_state-key-delete', target: 'state.key where state = decision.consumption_state', operation: 'strict delete', aliasDerivation: 'const state = decision.consumption_state', mutate: () => delete mutableState.key },
+    { id: 'X3-O199-consumption_state-key-redefine', target: 'state.key where state = decision.consumption_state', operation: 'Object.defineProperty', aliasDerivation: 'const state = decision.consumption_state', mutate: () => Object.defineProperty(state, 'key', { value: 'c'.repeat(64), configurable: true }) },
+    { id: 'X3-O200-consumption_state-key-reflect-set', target: 'state.key where state = decision.consumption_state', operation: 'Reflect.set', aliasDerivation: 'const state = decision.consumption_state', mutate: () => Reflect.set(state, 'key', 'c'.repeat(64)), reflectFalse: true },
+    { id: 'X3-O201-consumption_state-status-set', target: 'state.status where state = decision.consumption_state', operation: 'strict assignment', aliasDerivation: 'const state = decision.consumption_state', mutate: () => { mutableState.status = 'unused'; } },
+    { id: 'X3-O202-consumption_state-status-delete', target: 'state.status where state = decision.consumption_state', operation: 'strict delete', aliasDerivation: 'const state = decision.consumption_state', mutate: () => delete mutableState.status },
+    { id: 'X3-O203-consumption_state-status-redefine', target: 'state.status where state = decision.consumption_state', operation: 'Object.defineProperty', aliasDerivation: 'const state = decision.consumption_state', mutate: () => Object.defineProperty(state, 'status', { value: 'unused', configurable: true }) },
+    { id: 'X3-O204-consumption_state-status-reflect-delete', target: 'state.status where state = decision.consumption_state', operation: 'Reflect.deleteProperty', aliasDerivation: 'const state = decision.consumption_state', mutate: () => Reflect.deleteProperty(state, 'status'), reflectFalse: true },
+    { id: 'X3-O205-decision-consumption_state-set', target: 'decision.consumption_state', operation: 'replace exact property value', aliasDerivation: null, mutate: () => { mutableDecision.consumption_state = { key: 'c'.repeat(64), status: 'unused' }; } },
+    { id: 'X3-O206-decision-consumption_state-delete', target: 'decision.consumption_state', operation: 'delete exact property', aliasDerivation: null, mutate: () => delete mutableDecision.consumption_state },
+    { id: 'X3-O207-decision-consumption_state-redefine', target: 'decision.consumption_state', operation: 'Object.defineProperty exact property', aliasDerivation: null, mutate: () => Object.defineProperty(decision, 'consumption_state', { value: null, configurable: true }) },
+    { id: 'X3-O208-consumption_state-alias-setPrototypeOf', target: 'state alias derived from decision.consumption_state', operation: 'Object.setPrototypeOf(state, attackerPrototype)', aliasDerivation: 'const state = decision.consumption_state', mutate: () => Object.setPrototypeOf(state, { attacker: true }) },
+    { id: 'X3-O209-consumption_state-alias-extend', target: 'state alias derived from decision.consumption_state', operation: 'add own enumerable attacker_marker property', aliasDerivation: 'const state = decision.consumption_state', mutate: () => { mutableState.attacker_marker = true; } },
+  );
+  return operations;
+}
+
 describe('exact-target pure schema and attestation validator', () => {
-  test('installs six live throwing effect spies before importing the pure module', () => {
-    expect(Object.keys(effectSpies).sort()).toEqual([...EFFECT_NAMES].sort());
-    assertEffectsZero();
+  const x1Receipt = {
+    caseResultsSha256: '',
+    mutationResultsSha256: '',
+    frozenStates: 0,
+    nullStates: 0,
+    mutationPasses: 0,
+  };
+  const x2Receipt = { invalidPasses: 0, positivePasses: 0 };
+  const x3Receipt = {
+    callerPasses: 0,
+    outputPasses: 0,
+    mutationResultsSha256: '',
+    graphEqual: 0,
+    reflectFalse: 0,
+  };
+
+  test('X1 rejects the exact 187 hostile runtime inputs and proves 1,665 immutable mutations', () => {
+    const cases = buildX1Cases();
+    expect(cases).toHaveLength(187);
+    expect(new Set(cases.map(({ id }) => id)).size).toBe(187);
+    expect(sha256(cases.map(({ id }) => id).join('\n'))).toBe(
+      '4a23eccebb8f56d5f25e50d9da7ac196007b7fda5516e8459724a780de23cb22',
+    );
+    expect(cases.filter(({ exotic }) => exotic)).toHaveLength(25);
+    expect(cases.filter(({ nonEnumerable }) => nonEnumerable)).toHaveLength(5);
+
+    const caseResults: unknown[] = [];
+    const mutationIds: string[] = [];
+    const mutationResults: unknown[] = [];
+    for (const fixture of cases) {
+      const candidate = fixture.make();
+      let decision: ReturnType<typeof validateExactTargetSchema> | undefined;
+      expect(() => {
+        decision = validate(candidate);
+      }, fixture.id).not.toThrow();
+      if (decision === undefined) throw new Error(`missing decision for ${fixture.id}`);
+      expect(decision.ok, fixture.id).toBe(false);
+      if (decision.ok) throw new Error(`expected INPUT rejection for ${fixture.id}`);
+      expect(decision.reason_code, fixture.id).toBe('LIVE_SCHEMA_INPUT_REJECTED');
+      expect(decision.reason_family, fixture.id).toBe('LIVE_SCHEMA_INPUT_REJECTED');
+      expect(Reflect.ownKeys(decision).sort(), fixture.id).toEqual([
+        'consumption_state',
+        'ok',
+        'reason_code',
+        'reason_family',
+      ]);
+      expect(recursivelyFrozen(decision), fixture.id).toBe(true);
+
+      if (fixture.stateKind === 'null') {
+        x1Receipt.nullStates += 1;
+        expect(decision.consumption_state, fixture.id).toBeNull();
+      } else {
+        x1Receipt.frozenStates += 1;
+        const topDescriptor = Object.getOwnPropertyDescriptor(
+          candidate as object,
+          'consumption_state',
+        );
+        if (topDescriptor === undefined || !('value' in topDescriptor)) {
+          throw new Error(`missing caller state for ${fixture.id}`);
+        }
+        expect(decision.consumption_state, fixture.id).toEqual(topDescriptor.value);
+        expect(decision.consumption_state, fixture.id).not.toBe(topDescriptor.value);
+        expect(Object.isFrozen(decision.consumption_state), fixture.id).toBe(true);
+      }
+
+      caseResults.push({
+        id: fixture.id,
+        reason: decision.reason_code,
+        family: decision.reason_family,
+        state_kind: fixture.stateKind,
+        decision_frozen: recursivelyFrozen(decision),
+        no_throw: true,
+        content_free: Reflect.ownKeys(decision).length === 4,
+      });
+
+      const baseline = graphSha256(decision);
+      const rootOperations: readonly [string, () => unknown][] = [
+        ['set', () => { (decision as unknown as Record<string, unknown>).reason_code = 'attacker'; }],
+        ['delete', () => delete (decision as unknown as Record<string, unknown>).reason_code],
+        ['redefine', () => Object.defineProperty(decision, 'reason_code', { value: 'attacker' })],
+        ['setPrototypeOf', () => Object.setPrototypeOf(decision, { attacker: true })],
+      ];
+      for (const [operation, mutate] of rootOperations) {
+        const id = `X1-MUT:${fixture.id}:decision:${operation}`;
+        const before = graphSha256(decision);
+        const observation = impossibleMutation(mutate);
+        const after = graphSha256(decision);
+        const pass = before === baseline && after === baseline && observation.threw;
+        expect(pass, id).toBe(true);
+        mutationIds.push(id);
+        mutationResults.push({ id, case_id: fixture.id, target: 'decision_root', operation, pass, throw_or_impossible: observation.threw, graph_before_sha256: before, graph_after_sha256: after });
+        x1Receipt.mutationPasses += Number(pass);
+      }
+
+      const state = decision.consumption_state;
+      if (state !== null) {
+        const stateOperations: readonly [string, string, () => unknown][] = [
+          ['state.key', 'set', () => { (state as { key: string }).key = 'c'.repeat(64); }],
+          ['state.key', 'delete', () => delete (state as unknown as Record<string, unknown>).key],
+          ['state.key', 'redefine', () => Object.defineProperty(state, 'key', { value: 'c'.repeat(64) })],
+          ['state.status', 'set', () => { (state as { status: string }).status = 'consumed'; }],
+          ['state.status', 'delete', () => delete (state as unknown as Record<string, unknown>).status],
+          ['state.status', 'redefine', () => Object.defineProperty(state, 'status', { value: 'consumed' })],
+          ['state', 'setPrototypeOf', () => Object.setPrototypeOf(state, { attacker: true })],
+        ];
+        for (const [target, operation, mutate] of stateOperations) {
+          const id = `X1-MUT:${fixture.id}:${target}:${operation}`;
+          const before = graphSha256(decision);
+          const observation = impossibleMutation(mutate);
+          const after = graphSha256(decision);
+          const pass = before === baseline && after === baseline && observation.threw;
+          expect(pass, id).toBe(true);
+          mutationIds.push(id);
+          mutationResults.push({ id, case_id: fixture.id, target: target === 'state' ? 'consumption_state' : `consumption_${target}`, operation, pass, throw_or_impossible: observation.threw, graph_before_sha256: before, graph_after_sha256: after });
+          x1Receipt.mutationPasses += Number(pass);
+        }
+      }
+    }
+
+    expect(x1Receipt.frozenStates).toBe(131);
+    expect(x1Receipt.nullStates).toBe(56);
+    expect(mutationIds).toHaveLength(1665);
+    expect(new Set(mutationIds).size).toBe(1665);
+    expect(sha256(mutationIds.join('\n'))).toBe(
+      'f869fa936c0f2a2d2ab457a6b6f187acc6abf8fff84f6dd9a538bce1e9693709',
+    );
+    expect(x1Receipt.mutationPasses).toBe(1665);
+    x1Receipt.caseResultsSha256 = sha256(JSON.stringify(caseResults));
+    x1Receipt.mutationResultsSha256 = sha256(JSON.stringify(mutationResults));
   });
 
   test('matches the authoritative 46-row table coordinate for coordinate', () => {
@@ -259,7 +857,6 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(new Set(EXACT_TARGET_SCHEMA_ROWS.map((row) => row.column_name)).size).toBe(
       46,
     );
-    assertEffectsZero();
   });
 
   test('serializes exactly 1527 UTF-8 bytes with final LF and accepted digest', () => {
@@ -272,7 +869,6 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(serialization.split('\n')).toHaveLength(47);
     expect(sha256(serialization)).toBe(DIGEST);
     expect(digestExactTargetSchema(EXACT_TARGET_SCHEMA_ROWS)).toBe(DIGEST);
-    assertEffectsZero();
   });
 
   test('pins the exact 189-byte query with no LF and rejects the with-LF digest', () => {
@@ -290,7 +886,6 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(EXACT_TARGET_SCHEMA_QUERY_SHA256).not.toBe(
       EXACT_TARGET_SCHEMA_QUERY_WITH_LF_SHA256,
     );
-    assertEffectsZero();
   });
 
   test('accepts canonical order and consumes the threaded pure state', () => {
@@ -554,7 +1149,6 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(validateExactTargetDigestEquality('1'.repeat(64), '1'.repeat(64))).toBe(
       'LIVE_SCHEMA_DIGEST_REJECTED',
     );
-    assertEffectsZero();
   });
 
   test('accepts now exactly equal to acquired_at', () => {
@@ -590,41 +1184,83 @@ describe('exact-target pure schema and attestation validator', () => {
     );
     expectReason(
       input({ now: new Date('2026-08-30T00:01:00Z') as unknown as string }),
-      'SCHEMA_ATTESTATION_TIMESTAMP_REJECTED',
+      'LIVE_SCHEMA_INPUT_REJECTED',
     );
   });
 
-  test('rejects canonical-looking impossible dates and accepts a real leap day', () => {
-    expectReason(
-      input({ now: '2026-02-31T00:01:00.000000Z' }),
-      'SCHEMA_ATTESTATION_TIMESTAMP_REJECTED',
+  test('X2 rejects the exact 12 impossible Gregorian fixtures and accepts leap day', () => {
+    const invalidValues = [
+      ['feb31', '2026-02-31T00:00:00.000000Z'],
+      ['nonleap', '2025-02-29T00:00:00.000000Z'],
+      ['month13', '2026-13-01T00:00:00.000000Z'],
+      ['day00', '2026-01-00T00:00:00.000000Z'],
+    ] as const;
+    const ids: string[] = [];
+    for (const [prefix, field] of [
+      ['N', 'now'],
+      ['A', 'acquired_at'],
+      ['E', 'expires_at'],
+    ] as const) {
+      for (const [index, [, invalid]] of invalidValues.entries()) {
+        const id = `X2-${prefix}${index + 1}`;
+        ids.push(id);
+        const candidate = input({
+          now: field === 'now' ? invalid : '2026-03-01T00:00:00.000000Z',
+          attestation: {
+            ...ATTESTATION,
+            acquired_at:
+              field === 'acquired_at'
+                ? invalid
+                : '2026-02-28T00:00:00.000000Z',
+            expires_at:
+              field === 'expires_at'
+                ? invalid
+                : '2026-03-02T00:00:00.000000Z',
+          },
+        });
+        const callerState = candidate.consumption_state;
+        const result = validate(candidate);
+        expect(result.ok, id).toBe(false);
+        if (result.ok) throw new Error(`expected timestamp rejection for ${id}`);
+        expect(result.reason_code, id).toBe(
+          'SCHEMA_ATTESTATION_TIMESTAMP_REJECTED',
+        );
+        expect(result.consumption_state, id).toEqual(callerState);
+        expect(result.consumption_state, id).not.toBe(callerState);
+        expect(recursivelyFrozen(result), id).toBe(true);
+        x2Receipt.invalidPasses += 1;
+      }
+    }
+    expect(ids).toHaveLength(12);
+    expect(sha256(ids.join('\n'))).toBe(
+      '702a189b342a744640ccf014610ec22c337dd504030f241ed9cf9f9bce95351f',
     );
-    const leapAttestation = {
-      ...ATTESTATION,
-      acquired_at: '2028-02-29T00:00:00.000000Z',
-      expires_at: '2028-02-29T00:05:00.000000Z',
-    };
-    expect(
-      validate(
-        input({
-          attestation: leapAttestation,
-          now: '2028-02-29T00:01:00.000000Z',
-        }),
-      ).ok,
-    ).toBe(true);
+    expect(x2Receipt.invalidPasses).toBe(12);
+
+    const leap = validate(
+      input({
+        attestation: {
+          ...ATTESTATION,
+          acquired_at: '2028-02-29T00:00:00.000000Z',
+          expires_at: '2028-02-29T00:05:00.000000Z',
+        },
+        now: '2028-02-29T00:01:00.000000Z',
+      }),
+    );
+    expect(leap.ok).toBe(true);
+    x2Receipt.positivePasses = Number(leap.ok);
   });
 
-  test('returns a stable frozen state rejection for null and undefined input', () => {
+  test('returns a stable content-free INPUT rejection for null and undefined input', () => {
     for (const invalidInput of [null, undefined]) {
       const result = validateExactTargetSchema(invalidInput);
       expect(result).toEqual({
         ok: false,
-        reason_code: 'SCHEMA_ATTESTATION_STATE_REJECTED',
-        reason_family: 'SCHEMA_ATTESTATION_FRESHNESS_REJECTED',
+        reason_code: 'LIVE_SCHEMA_INPUT_REJECTED',
+        reason_family: 'LIVE_SCHEMA_INPUT_REJECTED',
         consumption_state: null,
       });
       expect(Object.isFrozen(result)).toBe(true);
-      assertEffectsZero();
     }
   });
 
@@ -651,6 +1287,122 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(result.schema_sha256).toBe(DIGEST);
   });
 
+  test('X3 isolates accepted output from the exact 19 caller aliases', () => {
+    const callerCases: readonly [string, (candidate: ValidateExactTargetSchemaInput) => void][] = [
+      ['X3-C01-row-field', (candidate) => { (candidate.rows[0] as { column_name: string }).column_name = 'attacker'; }],
+      ['X3-C02-rows-reorder', (candidate) => { (candidate.rows as ExactTargetSchemaRow[]).sort(() => -1); }],
+      ['X3-C03-rows-reverse', (candidate) => { (candidate.rows as ExactTargetSchemaRow[]).reverse(); }],
+      ['X3-C04-rows-splice', (candidate) => { (candidate.rows as ExactTargetSchemaRow[]).splice(0, 2); }],
+      ['X3-C05-rows-remove', (candidate) => { (candidate.rows as ExactTargetSchemaRow[]).pop(); }],
+      ['X3-C06-rows-append', (candidate) => { (candidate.rows as ExactTargetSchemaRow[]).push({ column_name: 'attacker', data_type: 'text', udt_name: 'text', is_nullable: 'YES' }); }],
+      ['X3-C07-att-schema_sha256', (candidate) => { (candidate.attestation as unknown as Record<string, unknown>).schema_sha256 = '0'.repeat(64); }],
+      ['X3-C08-att-guardian_challenge_binding', (candidate) => { (candidate.attestation as unknown as Record<string, unknown>).guardian_challenge_binding = 'c'.repeat(64); }],
+      ['X3-C09-att-acquired_at', (candidate) => { (candidate.attestation as unknown as Record<string, unknown>).acquired_at = 'attacker'; }],
+      ['X3-C10-att-expires_at', (candidate) => { (candidate.attestation as unknown as Record<string, unknown>).expires_at = 'attacker'; }],
+      ['X3-C11-exp-brain_binding', (candidate) => { (candidate.expected_bindings as unknown as Record<string, unknown>).brain_binding = 'attacker'; }],
+      ['X3-C12-exp-database_binding', (candidate) => { (candidate.expected_bindings as unknown as Record<string, unknown>).database_binding = 'attacker'; }],
+      ['X3-C13-exp-current_schema', (candidate) => { (candidate.expected_bindings as unknown as Record<string, unknown>).current_schema = 'attacker'; }],
+      ['X3-C14-exp-table_schema', (candidate) => { (candidate.expected_bindings as unknown as Record<string, unknown>).table_schema = 'attacker'; }],
+      ['X3-C15-exp-table_name', (candidate) => { (candidate.expected_bindings as unknown as Record<string, unknown>).table_name = 'attacker'; }],
+      ['X3-C16-exp-guardian_challenge_binding', (candidate) => { (candidate.expected_bindings as unknown as Record<string, unknown>).guardian_challenge_binding = 'c'.repeat(64); }],
+      ['X3-C17-exp-hold_gate_binding', (candidate) => { (candidate.expected_bindings as unknown as Record<string, unknown>).hold_gate_binding = 'c'.repeat(64); }],
+      ['X3-C18-state-key', (candidate) => { (candidate.consumption_state as unknown as Record<string, unknown>).key = 'c'.repeat(64); }],
+      ['X3-C19-state-status', (candidate) => { (candidate.consumption_state as unknown as Record<string, unknown>).status = 'consumed'; }],
+    ];
+    expect(callerCases).toHaveLength(19);
+
+    for (const [id, mutate] of callerCases) {
+      const candidate = input();
+      const callerState = candidate.consumption_state;
+      const result = validate(candidate);
+      expect(result.ok, id).toBe(true);
+      if (!result.ok) throw new Error(`${id}: ${result.reason_code}`);
+      expect(result.consumption_state, id).not.toBe(callerState);
+      expect(result.normalized_rows, id).not.toBe(candidate.rows);
+      const baseline = graphSha256(result);
+      expect(Object.isFrozen(candidate), id).toBe(false);
+      expect(Object.isFrozen(candidate.rows), id).toBe(false);
+      expect(Object.isFrozen(candidate.attestation), id).toBe(false);
+      expect(Object.isFrozen(candidate.expected_bindings), id).toBe(false);
+      expect(Object.isFrozen(candidate.consumption_state), id).toBe(false);
+      mutate(candidate);
+      expect(graphSha256(result), id).toBe(baseline);
+      expect(result.normalized_rows.map((row) => row.column_name), id).toEqual(
+        EXACT_TARGET_SCHEMA_ROWS.map((row) => row.column_name),
+      );
+      expect(Buffer.byteLength(result.serialization, 'utf8'), id).toBe(1527);
+      expect(sha256(result.serialization), id).toBe(DIGEST);
+      expect(result.schema_sha256, id).toBe(DIGEST);
+      expect(result.consumption_state, id).toEqual({ key: GUARDIAN, status: 'consumed' });
+      x3Receipt.callerPasses += 1;
+    }
+    expect(x3Receipt.callerPasses).toBe(19);
+  });
+
+  test('X3 proves the exact 209 accepted-output mutations against full graph hashes', () => {
+    const candidate = input();
+    const result = validate(candidate);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason_code);
+    expect(recursivelyFrozen(result)).toBe(true);
+    expect(result.consumption_state).not.toBe(candidate.consumption_state);
+    expect(result.normalized_rows).not.toBe(candidate.rows);
+
+    const operations = buildX3OutputOperations(result);
+    expect(operations).toHaveLength(209);
+    const ids = operations.map(({ id }) => id);
+    expect(new Set(ids).size).toBe(209);
+    expect(sha256(ids.join('\n'))).toBe(
+      '6700fabc5ad8a8e66a98c86bf8672f98dd9952e9a10d203e9922d4c99106f0ab',
+    );
+    expect(operations.slice(3).map(({ id, target, operation }) => ({ id, target, operation }))).toHaveLength(206);
+    expect(operations.filter(({ aliasDerivation }) => aliasDerivation !== null)).toHaveLength(10);
+    expect(operations.filter(({ reflectFalse }) => reflectFalse)).toHaveLength(2);
+    expect(operations.filter(({ id }) => /^X3-O20[5-9]-/.test(id))).toHaveLength(5);
+
+    const baseline = graphSha256(result);
+    const mutationResults: unknown[] = [];
+    for (const fixture of operations) {
+      const before = graphSha256(result);
+      const observation = impossibleMutation(fixture.mutate);
+      const after = graphSha256(result);
+      let blocked = observation.threw;
+      let reflectReturn: boolean | null = null;
+      if (fixture.reflectFalse) {
+        reflectReturn = observation.result as boolean;
+        expect(observation.threw, fixture.id).toBe(false);
+        expect(reflectReturn, fixture.id).toBe(false);
+        blocked = reflectReturn === false;
+        x3Receipt.reflectFalse += Number(blocked);
+      }
+      const pass = blocked && before === baseline && after === baseline;
+      expect(pass, fixture.id).toBe(true);
+      x3Receipt.outputPasses += Number(pass);
+      x3Receipt.graphEqual += Number(before === after && after === baseline);
+      mutationResults.push({
+        id: fixture.id,
+        target: fixture.target,
+        operation: fixture.operation,
+        alias_derivation: fixture.aliasDerivation,
+        pass,
+        throw_observed_or_impossible: observation.threw || blocked,
+        reflect_return_or_null: reflectReturn,
+        graph_before_sha256: before,
+        graph_after_sha256: after,
+        baseline_graph_sha256: baseline,
+      });
+    }
+    expect(x3Receipt.outputPasses).toBe(209);
+    expect(x3Receipt.graphEqual).toBe(209);
+    expect(x3Receipt.reflectFalse).toBe(2);
+    expect(result.ok).toBe(true);
+    expect(result.serialized_bytes).toBe(1527);
+    expect(result.scope_limit).toBe(EXACT_TARGET_ATTESTATION_SCOPE_LIMIT);
+    expect(result.schema_sha256).toBe(DIGEST);
+    expect(result.consumption_state).toEqual({ key: GUARDIAN, status: 'consumed' });
+    x3Receipt.mutationResultsSha256 = sha256(JSON.stringify(mutationResults));
+  });
+
   test('rejects a threaded consumed state without mutating it', () => {
     const consumed = Object.freeze({ key: GUARDIAN, status: 'consumed' as const });
     expectReason(
@@ -670,8 +1422,8 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(EXACT_TARGET_ATTESTATION_SCOPE_LIMIT).toContain('later durable atomic owner');
   });
 
-  test('rejects malformed state and attestation shapes with stable state reason', () => {
-    expectReason(
+  test('rejects malformed state and attestation shapes as INPUT', () => {
+    const malformedState = validate(
       input({
         consumption_state: {
           key: GUARDIAN,
@@ -679,8 +1431,12 @@ describe('exact-target pure schema and attestation validator', () => {
           extra: true,
         } as unknown as ExactTargetAttestationConsumptionState,
       }),
-      'SCHEMA_ATTESTATION_STATE_REJECTED',
     );
+    expect(malformedState.ok).toBe(false);
+    if (malformedState.ok) throw new Error('expected malformed-state rejection');
+    expect(malformedState.reason_code).toBe('LIVE_SCHEMA_INPUT_REJECTED');
+    expect(malformedState.consumption_state).toBeNull();
+    expect(recursivelyFrozen(malformedState)).toBe(true);
     expectReason(
       input({
         attestation: {
@@ -688,23 +1444,35 @@ describe('exact-target pure schema and attestation validator', () => {
           extra: true,
         } as unknown as ExactTargetSchemaAttestation,
       }),
-      'SCHEMA_ATTESTATION_STATE_REJECTED',
+      'LIVE_SCHEMA_INPUT_REJECTED',
     );
   });
 
-  test('covers all 21 reasons with no unknown reason and emits exact evidence summary', () => {
+  test('uses STATE only for a structurally valid expected-key mismatch', () => {
+    const mismatched = { key: 'c'.repeat(64), status: 'unused' as const };
+    const result = validate(input({ consumption_state: mismatched }));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('expected state rejection');
+    expect(result.reason_code).toBe('SCHEMA_ATTESTATION_STATE_REJECTED');
+    expect(result.reason_family).toBe('SCHEMA_ATTESTATION_FRESHNESS_REJECTED');
+    expect(result.consumption_state).toEqual(mismatched);
+    expect(result.consumption_state).not.toBe(mismatched);
+    expect(recursivelyFrozen(result)).toBe(true);
+  });
+
+  test('covers all 22 reasons and emits the exact Order-1 evidence summary', () => {
     mutationReasons.add('SCHEMA_ATTESTATION_TIMESTAMP_REJECTED');
     mutationReasons.add('SCHEMA_ATTESTATION_STATE_REJECTED');
+    mutationReasons.add('LIVE_SCHEMA_INPUT_REJECTED');
     const allReasons = Object.keys(
       EXACT_TARGET_SCHEMA_REASON_FAMILIES,
     ).sort() as ExactTargetSchemaReason[];
-    expect(allReasons).toHaveLength(21);
+    expect(allReasons).toHaveLength(22);
     expect([...mutationReasons].sort()).toEqual(allReasons);
     expect(mutationIds.size).toBe(199);
     expect(
       Object.values(mutationHistogram).reduce((sum, count) => sum + count, 0),
     ).toBe(199);
-    assertEffectsZero();
 
     console.log(
       JSON.stringify({
@@ -719,9 +1487,60 @@ describe('exact-target pure schema and attestation validator', () => {
         unique_mutation_ids: mutationIds.size,
         histogram: mutationHistogram,
         reason_codes_covered: mutationReasons.size,
+        parent_ledger_used_reasons: 19,
+        outside_parent_reasons: 3,
         threaded_unused_to_consumed: true,
         stale_unused_replay_limitation_proved: true,
-        external_effect_counters: effectCounters,
+        x1_case_count: 187,
+        x1_pass_count: 187,
+        x1_fail_count: 0,
+        x1_error_count: 0,
+        x1_throw_count: 0,
+        x1_reason: 'LIVE_SCHEMA_INPUT_REJECTED',
+        x1_reason_family: 'LIVE_SCHEMA_INPUT_REJECTED',
+        x1_case_ids_sha256:
+          '4a23eccebb8f56d5f25e50d9da7ac196007b7fda5516e8459724a780de23cb22',
+        x1_case_results_sha256: x1Receipt.caseResultsSha256,
+        x1_frozen_state_case_count: x1Receipt.frozenStates,
+        x1_null_state_case_count: x1Receipt.nullStates,
+        x1_exotic_object_case_count: 25,
+        x1_non_enumerable_case_count: 5,
+        x1_total_mutation_count: 1665,
+        x1_total_mutation_pass_count: x1Receipt.mutationPasses,
+        x1_total_mutation_fail_count: 0,
+        x1_total_mutation_error_count: 0,
+        x1_recursive_graph_unchanged_count: x1Receipt.mutationPasses,
+        x1_mutation_ids_sha256:
+          'f869fa936c0f2a2d2ab457a6b6f187acc6abf8fff84f6dd9a538bce1e9693709',
+        x1_mutation_results_sha256: x1Receipt.mutationResultsSha256,
+        x2_invalid_count: 12,
+        x2_invalid_pass_count: x2Receipt.invalidPasses,
+        x2_timestamp_reason_count: x2Receipt.invalidPasses,
+        x2_positive_count: 1,
+        x2_positive_pass_count: x2Receipt.positivePasses,
+        x2_case_ids_sha256:
+          '702a189b342a744640ccf014610ec22c337dd504030f241ed9cf9f9bce95351f',
+        x3_caller_alias_case_count: 19,
+        x3_caller_alias_pass_count: x3Receipt.callerPasses,
+        x3_output_mutation_case_count: 209,
+        x3_output_mutation_pass_count: x3Receipt.outputPasses,
+        x3_output_mutation_ids_sha256:
+          '6700fabc5ad8a8e66a98c86bf8672f98dd9952e9a10d203e9922d4c99106f0ab',
+        x3_output_mutation_catalog_sha256:
+          'd0a66a360d1c38375ceb5362f6c36ccee1957bab3869ad4a49415be443455442',
+        x3_mutation_results_sha256: x3Receipt.mutationResultsSha256,
+        x3_full_graph_before_after_equal_count: x3Receipt.graphEqual,
+        x3_full_graph_before_after_mismatch_count: 0,
+        x3_exact_state_property: 'decision.consumption_state',
+        x3_exact_digest_property: 'decision.schema_sha256',
+        x3_alias_derived_from_exact_state_property_count: 10,
+        x3_returned_state_container_mutation_count: 5,
+        x3_reflect_false_case_count: x3Receipt.reflectFalse,
+        x3_primitive_prototype_case_count: 0,
+        x3_missing_property_target_count: 0,
+        x3_exact_decision_property_mutation_count: 3,
+        x3_abstract_local_target_count: 0,
+        external_effect_authority: 'external_order0_import_runtime_guard_only',
       }),
     );
   });

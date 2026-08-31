@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { types as utilTypes } from 'node:util';
 import { EXACT_TARGET_SCHEMA_DIGEST } from './exact-target-contract.ts';
 
 export interface ExactTargetSchemaRow {
@@ -111,6 +112,7 @@ export const EXACT_TARGET_SCHEMA_ROWS: readonly ExactTargetSchemaRow[] =
   Object.freeze(schemaRows);
 
 export const EXACT_TARGET_SCHEMA_REASON_FAMILIES = Object.freeze({
+  LIVE_SCHEMA_INPUT_REJECTED: 'LIVE_SCHEMA_INPUT_REJECTED',
   LIVE_SCHEMA_COLUMN_MISSING_REJECTED: 'LIVE_SCHEMA_STRUCTURE_REJECTED',
   LIVE_SCHEMA_COLUMN_DUPLICATE_REJECTED: 'LIVE_SCHEMA_STRUCTURE_REJECTED',
   LIVE_SCHEMA_COLUMN_EXTRA_REJECTED: 'LIVE_SCHEMA_STRUCTURE_REJECTED',
@@ -213,6 +215,14 @@ const EXPECTED_BINDING_KEYS = [
   'table_name',
   'table_schema',
 ] as const;
+const INPUT_KEYS = [
+  'attestation',
+  'consumption_state',
+  'expected_bindings',
+  'now',
+  'rows',
+] as const;
+const STATE_KEYS = ['key', 'status'] as const;
 const HEX_64 = /^[0-9a-f]{64}$/;
 const UTC_SIX_MICROSECONDS = /^\d{4}-(0[1-9]|1[0-2])-([0-2]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{6}Z$/;
 
@@ -220,12 +230,127 @@ function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-function exactKeys(value: object, expected: readonly string[]): boolean {
-  const actual = Object.keys(value).sort();
-  return (
-    actual.length === expected.length &&
-    actual.every((key, index) => key === expected[index])
-  );
+type DataRecord = Readonly<Record<string, unknown>>;
+
+function inspectOrdinaryDataRecord(
+  value: unknown,
+  expected: readonly string[],
+): DataRecord | null {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    utilTypes.isProxy(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    return null;
+  }
+
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== expected.length ||
+    keys.some((key) => typeof key !== 'string')
+  ) {
+    return null;
+  }
+  const actual = [...(keys as string[])].sort();
+  const wanted = [...expected].sort();
+  if (!actual.every((key, index) => key === wanted[index])) return null;
+
+  const snapshot: Record<string, unknown> = {};
+  for (const key of expected) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !('value' in descriptor)
+    ) {
+      return null;
+    }
+    snapshot[key] = descriptor.value;
+  }
+  return snapshot;
+}
+
+function inspectDenseDataArray(value: unknown): readonly unknown[] | null {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    utilTypes.isProxy(value) ||
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype
+  ) {
+    return null;
+  }
+
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    !('value' in lengthDescriptor) ||
+    lengthDescriptor.enumerable ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0
+  ) {
+    return null;
+  }
+  const length = lengthDescriptor.value as number;
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== length + 1 ||
+    keys.some((key) => typeof key !== 'string')
+  ) {
+    return null;
+  }
+
+  const snapshot: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !('value' in descriptor)
+    ) {
+      return null;
+    }
+    snapshot.push(descriptor.value);
+  }
+  return snapshot;
+}
+
+function snapshotConsumptionState(
+  value: unknown,
+): ExactTargetAttestationConsumptionState | null {
+  const record = inspectOrdinaryDataRecord(value, STATE_KEYS);
+  if (record === null) return null;
+  const { key, status } = record;
+  if (
+    typeof key !== 'string' ||
+    !HEX_64.test(key) ||
+    (status !== 'unused' && status !== 'consumed')
+  ) {
+    return null;
+  }
+  return Object.freeze({ key, status });
+}
+
+function stateSnapshotFromUnknownInput(
+  value: unknown,
+): ExactTargetAttestationConsumptionState | null {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    utilTypes.isProxy(value)
+  ) {
+    return null;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'consumption_state');
+  if (
+    descriptor === undefined ||
+    !descriptor.enumerable ||
+    !('value' in descriptor)
+  ) {
+    return null;
+  }
+  return snapshotConsumptionState(descriptor.value);
 }
 
 function reject(
@@ -235,7 +360,10 @@ function reject(
   const stateSnapshot =
     consumption_state === null
       ? null
-      : Object.freeze({ ...consumption_state });
+      : Object.freeze({
+          key: consumption_state.key,
+          status: consumption_state.status,
+        });
   return Object.freeze({
     ok: false,
     reason_code,
@@ -269,6 +397,153 @@ function validCanonicalTimestamp(value: unknown): value is string {
     31,
   ];
   return year >= 1 && day >= 1 && day <= daysInMonth[month - 1]!;
+}
+
+interface ParsedValidateExactTargetSchemaInput {
+  readonly rows: readonly ExactTargetSchemaRow[];
+  readonly attestation: ExactTargetSchemaAttestation | null;
+  readonly now: string;
+  readonly consumption_state: ExactTargetAttestationConsumptionState;
+  readonly expected_bindings: ExactTargetExpectedBindings;
+}
+
+function parseRows(value: unknown): readonly ExactTargetSchemaRow[] | null {
+  const values = inspectDenseDataArray(value);
+  if (values === null) return null;
+  const rows: ExactTargetSchemaRow[] = [];
+  for (const value of values) {
+    const record = inspectOrdinaryDataRecord(value, ROW_KEYS);
+    if (record === null) return null;
+    const { column_name, data_type, udt_name, is_nullable } = record;
+    if (
+      typeof column_name !== 'string' ||
+      typeof data_type !== 'string' ||
+      typeof udt_name !== 'string' ||
+      typeof is_nullable !== 'string'
+    ) {
+      return null;
+    }
+    rows.push({
+      column_name,
+      data_type,
+      udt_name,
+      is_nullable: is_nullable as 'YES' | 'NO',
+    });
+  }
+  return rows;
+}
+
+function parseAttestation(value: unknown): ExactTargetSchemaAttestation | null | false {
+  if (value === null) return null;
+  const record = inspectOrdinaryDataRecord(value, ATTESTATION_KEYS);
+  if (record === null) return false;
+  const {
+    acquired_at,
+    brain_binding,
+    column_count,
+    current_schema,
+    database_binding,
+    expires_at,
+    guardian_challenge_binding,
+    hold_gate_binding,
+    query_contract_sha256,
+    schema_sha256,
+    table_name,
+    table_schema,
+  } = record;
+  if (
+    typeof acquired_at !== 'string' ||
+    typeof brain_binding !== 'string' ||
+    typeof column_count !== 'number' ||
+    !Number.isSafeInteger(column_count) ||
+    typeof current_schema !== 'string' ||
+    typeof database_binding !== 'string' ||
+    typeof expires_at !== 'string' ||
+    typeof guardian_challenge_binding !== 'string' ||
+    typeof hold_gate_binding !== 'string' ||
+    typeof query_contract_sha256 !== 'string' ||
+    typeof schema_sha256 !== 'string' ||
+    typeof table_name !== 'string' ||
+    typeof table_schema !== 'string'
+  ) {
+    return false;
+  }
+  return {
+    acquired_at,
+    brain_binding,
+    column_count,
+    current_schema,
+    database_binding,
+    expires_at,
+    guardian_challenge_binding,
+    hold_gate_binding,
+    query_contract_sha256,
+    schema_sha256,
+    table_name,
+    table_schema,
+  };
+}
+
+function parseExpectedBindings(value: unknown): ExactTargetExpectedBindings | null {
+  const record = inspectOrdinaryDataRecord(value, EXPECTED_BINDING_KEYS);
+  if (record === null) return null;
+  const {
+    brain_binding,
+    current_schema,
+    database_binding,
+    guardian_challenge_binding,
+    hold_gate_binding,
+    table_name,
+    table_schema,
+  } = record;
+  if (
+    brain_binding !== 'private' ||
+    database_binding !== 'mike_brain' ||
+    current_schema !== 'public' ||
+    table_schema !== 'public' ||
+    table_name !== 'minion_jobs' ||
+    typeof guardian_challenge_binding !== 'string' ||
+    !HEX_64.test(guardian_challenge_binding) ||
+    typeof hold_gate_binding !== 'string' ||
+    !HEX_64.test(hold_gate_binding)
+  ) {
+    return null;
+  }
+  return {
+    brain_binding,
+    current_schema,
+    database_binding,
+    guardian_challenge_binding,
+    hold_gate_binding,
+    table_name,
+    table_schema,
+  };
+}
+
+function parseValidateExactTargetSchemaInput(
+  value: unknown,
+): ParsedValidateExactTargetSchemaInput | null {
+  const record = inspectOrdinaryDataRecord(value, INPUT_KEYS);
+  if (record === null || typeof record.now !== 'string') return null;
+  const rows = parseRows(record.rows);
+  const attestation = parseAttestation(record.attestation);
+  const consumption_state = snapshotConsumptionState(record.consumption_state);
+  const expected_bindings = parseExpectedBindings(record.expected_bindings);
+  if (
+    rows === null ||
+    attestation === false ||
+    consumption_state === null ||
+    expected_bindings === null
+  ) {
+    return null;
+  }
+  return {
+    rows,
+    attestation,
+    now: record.now,
+    consumption_state,
+    expected_bindings,
+  };
 }
 
 function compareColumnName(
@@ -309,45 +584,26 @@ export function validateExactTargetDigestEquality(
 }
 
 export function validateExactTargetSchema(
-  input: ValidateExactTargetSchemaInput | null | undefined,
+  input: unknown,
 ): ExactTargetSchemaValidationResult {
-  if (!input || typeof input !== 'object') {
-    return reject('SCHEMA_ATTESTATION_STATE_REJECTED', null);
+  let safeState: ExactTargetAttestationConsumptionState | null = null;
+  let parsed: ParsedValidateExactTargetSchemaInput | null = null;
+  try {
+    safeState = stateSnapshotFromUnknownInput(input);
+    parsed = parseValidateExactTargetSchemaInput(input);
+  } catch {
+    return reject('LIVE_SCHEMA_INPUT_REJECTED', safeState);
   }
-  const state = input.consumption_state;
-  if (
-    !Array.isArray(input.rows) ||
-    !state ||
-    typeof state !== 'object' ||
-    !exactKeys(state, ['key', 'status']) ||
-    !HEX_64.test(state.key) ||
-    (state.status !== 'unused' && state.status !== 'consumed') ||
-    !input.expected_bindings ||
-    !exactKeys(input.expected_bindings, EXPECTED_BINDING_KEYS) ||
-    input.expected_bindings.brain_binding !== 'private' ||
-    input.expected_bindings.database_binding !== 'mike_brain' ||
-    input.expected_bindings.current_schema !== 'public' ||
-    input.expected_bindings.table_schema !== 'public' ||
-    input.expected_bindings.table_name !== 'minion_jobs' ||
-    !HEX_64.test(input.expected_bindings.guardian_challenge_binding) ||
-    !HEX_64.test(input.expected_bindings.hold_gate_binding) ||
-    state.key !== input.expected_bindings.guardian_challenge_binding
-  ) {
+  if (parsed === null) {
+    return reject('LIVE_SCHEMA_INPUT_REJECTED', safeState);
+  }
+  const { rows, attestation, now, consumption_state: state, expected_bindings } =
+    parsed;
+  if (state.key !== expected_bindings.guardian_challenge_binding) {
     return reject('SCHEMA_ATTESTATION_STATE_REJECTED', state);
   }
 
-  for (const row of input.rows) {
-    if (
-      !row ||
-      typeof row !== 'object' ||
-      !exactKeys(row, ROW_KEYS) ||
-      typeof row.column_name !== 'string'
-    ) {
-      return reject('LIVE_SCHEMA_COLUMN_EXTRA_REJECTED', state);
-    }
-  }
-
-  const names = input.rows.map((row) => row.column_name);
+  const names = rows.map((row) => row.column_name);
   if (new Set(names).size !== names.length) {
     return reject('LIVE_SCHEMA_COLUMN_DUPLICATE_REJECTED', state);
   }
@@ -366,7 +622,7 @@ export function validateExactTargetSchema(
     return reject('LIVE_SCHEMA_COLUMN_MISSING_REJECTED', state);
   }
 
-  const normalized = [...input.rows].sort(compareColumnName);
+  const normalized = [...rows].sort(compareColumnName);
   for (const [index, canonical] of EXACT_TARGET_SCHEMA_ROWS.entries()) {
     const actual = normalized[index]!;
     if (actual.data_type !== canonical.data_type) {
@@ -380,41 +636,37 @@ export function validateExactTargetSchema(
     }
   }
 
-  const attestation = input.attestation;
-  if (attestation === null || attestation === undefined) {
+  if (attestation === null) {
     return reject('SCHEMA_ATTESTATION_MISSING_REJECTED', state);
-  }
-  if (!exactKeys(attestation, ATTESTATION_KEYS)) {
-    return reject('SCHEMA_ATTESTATION_STATE_REJECTED', state);
   }
   if (state.status === 'consumed') {
     return reject('SCHEMA_ATTESTATION_REUSED_REJECTED', state);
   }
   if (
-    !validCanonicalTimestamp(input.now) ||
+    !validCanonicalTimestamp(now) ||
     !validCanonicalTimestamp(attestation.acquired_at) ||
     !validCanonicalTimestamp(attestation.expires_at) ||
     attestation.expires_at <= attestation.acquired_at ||
-    input.now < attestation.acquired_at
+    now < attestation.acquired_at
   ) {
     return reject('SCHEMA_ATTESTATION_TIMESTAMP_REJECTED', state);
   }
-  if (input.now >= attestation.expires_at) {
+  if (now >= attestation.expires_at) {
     return reject('SCHEMA_ATTESTATION_EXPIRED_REJECTED', state);
   }
-  if (attestation.brain_binding !== input.expected_bindings.brain_binding) {
+  if (attestation.brain_binding !== expected_bindings.brain_binding) {
     return reject('SCHEMA_ATTESTATION_BRAIN_REJECTED', state);
   }
-  if (attestation.database_binding !== input.expected_bindings.database_binding) {
+  if (attestation.database_binding !== expected_bindings.database_binding) {
     return reject('SCHEMA_ATTESTATION_DATABASE_REJECTED', state);
   }
-  if (attestation.current_schema !== input.expected_bindings.current_schema) {
+  if (attestation.current_schema !== expected_bindings.current_schema) {
     return reject('SCHEMA_ATTESTATION_CURRENT_SCHEMA_REJECTED', state);
   }
-  if (attestation.table_schema !== input.expected_bindings.table_schema) {
+  if (attestation.table_schema !== expected_bindings.table_schema) {
     return reject('SCHEMA_ATTESTATION_TABLE_SCHEMA_REJECTED', state);
   }
-  if (attestation.table_name !== input.expected_bindings.table_name) {
+  if (attestation.table_name !== expected_bindings.table_name) {
     return reject('SCHEMA_ATTESTATION_TABLE_NAME_REJECTED', state);
   }
   if (attestation.column_count !== EXACT_TARGET_SCHEMA_ROWS.length) {
@@ -428,12 +680,12 @@ export function validateExactTargetSchema(
   }
   if (
     attestation.guardian_challenge_binding !==
-    input.expected_bindings.guardian_challenge_binding
+    expected_bindings.guardian_challenge_binding
   ) {
     return reject('SCHEMA_ATTESTATION_GUARDIAN_CHALLENGE_REJECTED', state);
   }
   if (
-    attestation.hold_gate_binding !== input.expected_bindings.hold_gate_binding
+    attestation.hold_gate_binding !== expected_bindings.hold_gate_binding
   ) {
     return reject('SCHEMA_ATTESTATION_HOLD_BINDING_REJECTED', state);
   }
