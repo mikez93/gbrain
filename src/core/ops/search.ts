@@ -26,12 +26,12 @@ import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { stampPageDispositions } from '../disposition/search.ts';
-import { stampFactPageBindings } from '../facts/page-bindings.ts';
+import { stampFactAuthorityEvidence, stampFactPageBindings } from '../facts/page-bindings.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
 import { resolveDispositionScope } from './dispositions.ts';
-import { canReadFactBindings, isFleetRouterContext } from './fleet-router-context.ts';
+import { canReadFactAuthority, canReadFactBindings, isFleetRouterContext } from './fleet-router-context.ts';
 import {
   federatedSearchScope,
   resolvePerCallMode,
@@ -327,6 +327,20 @@ async function resolveSnippetCap(ctx: OperationContext, p: Record<string, unknow
   return DEFAULT_AGENT_SNIPPET_CHARS;
 }
 
+async function stampOwnerFactMetadata(
+  ctx: OperationContext,
+  results: SearchResult[],
+): Promise<void> {
+  const authorized = canReadFactBindings(ctx);
+  await Promise.all([
+    stampFactPageBindings(ctx.engine, results, { authorized }),
+    stampFactAuthorityEvidence(ctx.engine, results, {
+      authorized,
+      sourceAuthorized: (sourceId) => canReadFactAuthority(ctx, sourceId),
+    }),
+  ]);
+}
+
 const search: Operation = {
   name: 'search',
   description: SEARCH_DESCRIPTION,
@@ -409,7 +423,7 @@ const search: Operation = {
       await stampUnverifiedExtractions(ctx.engine, results);
       await stampPageDispositions(ctx.engine, results);
       await stampPageUpdatedAt(ctx, results);
-      await stampFactPageBindings(ctx.engine, results, { authorized: canReadFactBindings(ctx) });
+      await stampOwnerFactMetadata(ctx, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false, fallbackMeta);
       ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, fallbackMeta, { conceptHint: true }));
@@ -442,7 +456,7 @@ const search: Operation = {
     });
     stampDeepResearchIds(results);
     await stampPageUpdatedAt(ctx, results);
-    await stampFactPageBindings(ctx.engine, results, { authorized: canReadFactBindings(ctx) });
+    await stampOwnerFactMetadata(ctx, results);
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
@@ -615,7 +629,7 @@ const query: Operation = {
         ...querySourceScope,
       });
       await stampPageDispositions(ctx.engine, results);
-      await stampFactPageBindings(ctx.engine, results, { authorized: canReadFactBindings(ctx) });
+      await stampOwnerFactMetadata(ctx, results);
       return applySnippetCap(results, snippetCap);
     }
 
@@ -787,7 +801,7 @@ const query: Operation = {
       }
     }
     await stampPageUpdatedAt(ctx, results);
-    await stampFactPageBindings(ctx.engine, results, { authorized: canReadFactBindings(ctx) });
+    await stampOwnerFactMetadata(ctx, results);
     const latency_ms = Date.now() - startedAt;
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the

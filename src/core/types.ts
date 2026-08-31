@@ -821,6 +821,8 @@ export interface SearchResult {
    * page's semantic/event date (`effective_date`).
    */
   updated_at?: string | null;
+  /** Complete, uncapped fact validity evidence for trusted owner routers. */
+  fact_authority_evidence?: import('./facts/page-bindings.ts').FactAuthorityEvidence;
   /** RFC 5322 Message-ID projected from allowlisted email frontmatter. */
   message_id?: string;
   /** Gmail thread id projected from allowlisted email frontmatter. */

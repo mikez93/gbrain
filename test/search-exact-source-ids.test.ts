@@ -124,6 +124,27 @@ describe('search source_ids trusted-local contract', () => {
     })).rejects.toMatchObject({ code: 'invalid_params' });
   });
 
+  test('attested empty or absent grants cannot retrieve or query authority for a foreign explicit source', async () => {
+    for (const allowedSources of [undefined, []] as Array<string[] | undefined>) {
+      const { ctx, calls } = context(true, 'brain-router-owner-0123456789ab', 'fleet_router');
+      ctx.sourceId = 'default';
+      if (allowedSources === undefined) delete ctx.auth!.allowedSources;
+      else ctx.auth!.allowedSources = allowedSources;
+      let rawSqlCalls = 0;
+      ctx.engine.executeRaw = (async () => {
+        rawSqlCalls += 1;
+        throw new Error('no SQL may run');
+      }) as typeof ctx.engine.executeRaw;
+
+      await expect(operationsByName.query.handler(ctx, {
+        query: 'fixture',
+        source_id: 'foreign-source',
+      })).rejects.toMatchObject({ code: 'permission_denied' });
+      expect(calls).toHaveLength(0);
+      expect(rawSqlCalls).toBe(0);
+    }
+  });
+
   test('accepts vectors locally and from the exact fleet-router OAuth identity', () => {
     const vector = [0.1, 0.2, 0.3];
     expect(normalizeTrustedQueryEmbedding(context(false).ctx, vector)).toHaveLength(3);

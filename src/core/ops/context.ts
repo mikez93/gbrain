@@ -509,7 +509,10 @@ export function resolveRequestedScope(
   }
   if (sourceIdParam !== undefined) {
     const allowed = ctx.auth?.allowedSources;
-    if (ctx.remote !== false && allowed && allowed.length > 0 && !allowed.includes(sourceIdParam)) {
+    const remoteSourceProven = allowed && allowed.length > 0
+      ? allowed.includes(sourceIdParam)
+      : ctx.sourceId === sourceIdParam;
+    if (ctx.remote !== false && !remoteSourceProven) {
       throw new OperationError(
         'permission_denied',
         'Requested source is outside your granted sources.',

@@ -26,3 +26,16 @@ export function isFleetRouterContext(ctx: OperationContext): boolean {
 export function canReadFactBindings(ctx: OperationContext): boolean {
   return ctx.remote === false || isFleetRouterContext(ctx);
 }
+
+/**
+ * Fact authority is source-scoped as well as role-scoped. A remote fleet
+ * router must prove the result source through either its nonempty federated
+ * read grant or the exact server-assigned scalar source.
+ */
+export function canReadFactAuthority(ctx: OperationContext, sourceId: string): boolean {
+  if (ctx.remote === false) return true;
+  if (!isFleetRouterContext(ctx)) return false;
+  const allowed = ctx.auth?.allowedSources;
+  if (allowed && allowed.length > 0) return allowed.includes(sourceId);
+  return typeof ctx.sourceId === 'string' && ctx.sourceId === sourceId;
+}

@@ -2,7 +2,9 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   factPageBindingsFor,
+  loadFactAuthorityEvidence,
   loadFactPageBindings,
+  stampFactAuthorityEvidence,
   stampFactPageBindings,
 } from '../src/core/facts/page-bindings.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
@@ -46,6 +48,100 @@ afterAll(async () => {
 });
 
 describe('fact page/session bindings', () => {
+  test('complete authority evidence keeps mixed history and rows beyond the lineage cap', async () => {
+    const rows = [
+      { slug: 'mixed', fact: 'terminal history', terminal: true },
+      { slug: 'mixed', fact: 'active head', terminal: false },
+      ...Array.from({ length: 25 }, (_, index) => ({
+        slug: 'beyond-cap', fact: `terminal history ${index}`, terminal: true,
+      })),
+      { slug: 'beyond-cap', fact: 'active head 26', terminal: false },
+    ];
+    const params: unknown[] = [];
+    const values = rows.map((row) => {
+      params.push(row.fact, row.slug, row.terminal ? '2021-01-01T00:00:00Z' : null);
+      const offset = params.length - 2;
+      return `('default', $${offset}, 'fact', 'private', 'high', 'mcp:put_page',
+        $${offset + 1}, 1, '2020-01-01T00:00:00Z', $${offset + 2})`;
+    }).join(',');
+    await engine.executeRaw(
+      `INSERT INTO facts
+         (source_id, fact, kind, visibility, notability, source, context,
+          confidence, valid_from, valid_until)
+       VALUES ${values}`,
+      params,
+    );
+    const evidence = await loadFactAuthorityEvidence(engine, [
+      { sourceId: 'default', slug: 'mixed' },
+      { sourceId: 'default', slug: 'beyond-cap' },
+    ], { authorized: true });
+    expect(evidence.get('default\u0000mixed')?.complete_summary).toMatchObject({
+      state: 'active_head', matching_count: 2, terminal_count: 1,
+      selected_active_fact: { fact_id: expect.any(Number) },
+    });
+    expect(evidence.get('default\u0000beyond-cap')?.complete_summary).toMatchObject({
+      state: 'active_head', matching_count: 26, terminal_count: 25,
+      selected_active_fact: { fact_id: expect.any(Number) },
+    });
+  });
+
+  test('an inverted interval poisons the whole authority batch alone or beside an active fact', async () => {
+    await engine.executeRaw(
+      `INSERT INTO facts
+         (source_id, fact, kind, visibility, notability, source, context,
+          confidence, valid_from, valid_until)
+       VALUES
+         ('default', 'inverted alone', 'fact', 'private', 'high', 'mcp:put_page',
+          'inverted-alone', 1, '2099-01-02T00:00:00Z', '2099-01-01T00:00:00Z'),
+         ('default', 'active neighbor', 'fact', 'private', 'high', 'mcp:put_page',
+          'inverted-plus-active', 1, '2020-01-01T00:00:00Z', NULL),
+         ('default', 'inverted neighbor', 'fact', 'private', 'high', 'mcp:put_page',
+          'inverted-plus-active', 1, '2099-01-02T00:00:00Z', '2099-01-01T00:00:00Z')`,
+    );
+    const results = [
+      { ...({} as SearchResult), source_id: 'default', slug: 'inverted-alone' },
+      { ...({} as SearchResult), source_id: 'default', slug: 'inverted-plus-active' },
+    ];
+    await stampFactAuthorityEvidence(engine, results, {
+      authorized: true,
+      sourceAuthorized: () => true,
+    });
+    expect(results.map((result) => result.fact_authority_evidence)).toEqual([
+      {
+        version: 'f9-fact-authority-evidence-v2', availability: 'unavailable',
+        authority_evaluated_at: null, complete_summary: null,
+      },
+      {
+        version: 'f9-fact-authority-evidence-v2', availability: 'unavailable',
+        authority_evaluated_at: null, complete_summary: null,
+      },
+    ]);
+  });
+
+  test('overlapping active heads poison the whole authority batch', async () => {
+    const authorityEngine = {
+      async executeRaw() {
+        return [{
+          ref_source_id: 'default', ref_slug: 'overlap',
+          evaluated_at: new Date('2026-08-31T06:00:00.000Z'),
+          matching_count: '2', active_count: '2', future_count: '0', terminal_count: '0',
+          partition_error_count: '0', selected_active_fact_id: '8',
+          selected_valid_from: new Date('2026-08-30T00:00:00.000Z'), selected_valid_until: null,
+          selected_expired_at: null, selected_superseded_by: null,
+        }];
+      },
+    } as unknown as PGLiteEngine;
+    const evidence = await loadFactAuthorityEvidence(
+      authorityEngine,
+      [{ sourceId: 'default', slug: 'overlap' }],
+      { authorized: true },
+    );
+    expect(evidence.get('default\u0000overlap')).toEqual({
+      version: 'f9-fact-authority-evidence-v2', availability: 'unavailable',
+      authority_evaluated_at: null, complete_summary: null,
+    });
+  });
+
   test('keeps capture origin separate from the physical entity fence across sources', async () => {
     const map = await loadFactPageBindings(engine, [
       { sourceId: 'default', slug: captureA },
