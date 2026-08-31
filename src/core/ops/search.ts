@@ -227,11 +227,21 @@ async function stampPageUpdatedAt(
   const pageIds = [...new Set(results.map((r) => r.page_id).filter(Number.isFinite))];
   if (pageIds.length === 0) return;
   try {
-    const rows = await ctx.engine.executeRaw<{ id: number; updated_at: Date | string | null }>(
-      'SELECT id, updated_at FROM pages WHERE id = ANY($1::int[])',
+    const rows = await ctx.engine.executeRaw<{
+      id: number;
+      updated_at: Date | string | null;
+      source_document_sha256: string | null;
+    }>(
+      `SELECT id, updated_at,
+              NULLIF(frontmatter->>'source-content-sha256', '') AS source_document_sha256
+         FROM pages
+        WHERE id = ANY($1::int[])`,
       [pageIds],
     );
-    const byId = new Map<number, string | null>();
+    const byId = new Map<number, {
+      updatedAt: string | null;
+      sourceDocumentSha256: string | null;
+    }>();
     for (const row of rows) {
       const raw = row.updated_at;
       const normalized = raw === null
@@ -239,10 +249,20 @@ async function stampPageUpdatedAt(
         : raw instanceof Date
           ? raw.toISOString()
           : new Date(raw).toISOString();
-      byId.set(Number(row.id), normalized);
+      const sourceDocumentSha256 =
+        typeof row.source_document_sha256 === 'string'
+        && /^[0-9a-f]{64}$/.test(row.source_document_sha256)
+          ? row.source_document_sha256
+          : null;
+      byId.set(Number(row.id), { updatedAt: normalized, sourceDocumentSha256 });
     }
     for (const result of results) {
-      if (byId.has(result.page_id)) result.updated_at = byId.get(result.page_id) ?? null;
+      const metadata = byId.get(result.page_id);
+      if (!metadata) continue;
+      result.updated_at = metadata.updatedAt;
+      if (metadata.sourceDocumentSha256) {
+        result.source_document_sha256 = metadata.sourceDocumentSha256;
+      }
     }
   } catch {
     // Freshness telemetry is additive. A legacy-schema/read failure must not

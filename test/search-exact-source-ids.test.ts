@@ -44,8 +44,12 @@ function context(
       return [{ ...row }];
     },
     executeRaw: async (sql: string) => {
-      if (sql.startsWith('SELECT id, updated_at FROM pages')) {
-        return [{ id: 7, updated_at: new Date('2026-08-28T12:34:56.000Z') }];
+      if (sql.includes("NULLIF(frontmatter->>'source-content-sha256'")) {
+        return [{
+          id: 7,
+          updated_at: new Date('2026-08-28T12:34:56.000Z'),
+          source_document_sha256: 'a'.repeat(64),
+        }];
       }
       if (sql.includes('WITH refs(source_id, slug)')) {
         return [{
@@ -99,6 +103,7 @@ describe('search source_ids trusted-local contract', () => {
     expect(calls[0].sourceIds).toEqual(['source-a', 'source-b']);
     expect(calls[0].sourceId).toBeUndefined();
     expect(result[0].updated_at).toBe('2026-08-28T12:34:56.000Z');
+    expect(result[0].source_document_sha256).toBe('a'.repeat(64));
   });
 
   test('remote callers cannot replace their server-assigned scope', async () => {

@@ -825,6 +825,8 @@ export interface SearchResult {
   fact_authority_evidence?: import('./facts/page-bindings.ts').FactAuthorityEvidence;
   /** Provider-free lexical evidence consumed by the authenticated fleet router. */
   retrieval_evidence?: import('./search/f9-relevance.ts').F9RetrievalEvidence;
+  /** Stable imported-document identity for collapsing split managed pages. */
+  source_document_sha256?: string;
   /** RFC 5322 Message-ID projected from allowlisted email frontmatter. */
   message_id?: string;
   /** Gmail thread id projected from allowlisted email frontmatter. */
