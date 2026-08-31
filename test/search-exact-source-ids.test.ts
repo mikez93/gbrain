@@ -106,6 +106,20 @@ describe('search source_ids trusted-local contract', () => {
     expect(result[0].source_document_sha256).toBe('a'.repeat(64));
   });
 
+  test('source document identity is limited to trusted local and fleet-router callers', async () => {
+    const ordinary = context(true, 'ordinary-client', 'ordinary_remote');
+    const ordinaryResult = await operationsByName.search.handler(ordinary.ctx, {
+      query: 'fixture',
+    }) as SearchResult[];
+    expect(ordinaryResult[0].source_document_sha256).toBeUndefined();
+
+    const fleet = context(true, 'brain-router-owner-0123456789ab', 'fleet_router');
+    const fleetResult = await operationsByName.search.handler(fleet.ctx, {
+      query: 'fixture',
+    }) as SearchResult[];
+    expect(fleetResult[0].source_document_sha256).toBe('a'.repeat(64));
+  });
+
   test('remote callers cannot replace their server-assigned scope', async () => {
     const { ctx, calls } = context(true);
     await expect(operationsByName.search.handler(ctx, {

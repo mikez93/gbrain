@@ -224,6 +224,7 @@ async function stampPageUpdatedAt(
   ctx: OperationContext,
   results: SearchResult[],
 ): Promise<void> {
+  const exposeSourceDocumentIdentity = ctx.remote === false || isFleetRouterContext(ctx);
   const pageIds = [...new Set(results.map((r) => r.page_id).filter(Number.isFinite))];
   if (pageIds.length === 0) return;
   try {
@@ -260,7 +261,7 @@ async function stampPageUpdatedAt(
       const metadata = byId.get(result.page_id);
       if (!metadata) continue;
       result.updated_at = metadata.updatedAt;
-      if (metadata.sourceDocumentSha256) {
+      if (exposeSourceDocumentIdentity && metadata.sourceDocumentSha256) {
         result.source_document_sha256 = metadata.sourceDocumentSha256;
       }
     }
