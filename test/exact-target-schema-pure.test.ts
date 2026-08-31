@@ -714,6 +714,217 @@ function buildX3OutputOperations(decision: AcceptedDecision): X3OutputOperation[
   return operations;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
+  }
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function x3CatalogEntry(operation: X3OutputOperation): Record<string, unknown> {
+  const genericExpected =
+    'strict-mode throw or observably impossible; recursively inspected graph remains byte/value-identical';
+  const detailed: Readonly<Record<string, Record<string, unknown>>> = {
+    'X3-O001-decision-ok-set': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'On an accepted decision, in strict mode assign false to exact own property decision.ok.',
+      alias_derivation: null,
+      cause_bound_observation:
+        'strict assignment throws or is observably impossible because the real own data property is frozen/nonwritable; no abstract-local binding path',
+      expected: 'full descriptor-graph before/after SHA-256 equal and decision.ok remains true',
+    },
+    'X3-O002-decision-serialized_bytes-delete': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'On an accepted decision, in strict mode delete exact own property decision.serialized_bytes.',
+      alias_derivation: null,
+      cause_bound_observation:
+        'strict delete throws or is observably impossible because the real own property is nonconfigurable; no abstract-local binding path',
+      expected:
+        'full descriptor-graph before/after SHA-256 equal and decision.serialized_bytes remains 1527',
+    },
+    'X3-O003-decision-scope_limit-redefine': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'On an accepted decision, call Object.defineProperty(decision, "scope_limit", {value:"attacker", configurable:true}).',
+      alias_derivation: null,
+      cause_bound_observation:
+        'defineProperty throws because the real frozen own property is nonconfigurable; no abstract-local or missing-property path',
+      expected:
+        'full descriptor-graph before/after SHA-256 equal and decision.scope_limit remains exact accepted constant',
+    },
+    'X3-O196-decision-schema_sha256-replace': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'In strict mode assign an attacker digest string to exact own property decision.schema_sha256.',
+      alias_derivation: null,
+      cause_bound_observation:
+        'throw or observably impossible because decision property is frozen; no missing-property or primitive-TypeError path',
+      expected: 'full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O197-consumption_state-key-set': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'Derive `const state = decision.consumption_state`; assert exact frozen returned state/nonalias; in strict mode assign a different 64-lowercase-hex value to state.key.',
+      alias_derivation: operation.aliasDerivation,
+      cause_bound_observation:
+        'strict assignment throws or is impossible on the real frozen key property',
+      expected: 'full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O198-consumption_state-key-delete': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe: 'Derive exact state alias; in strict mode delete state.key.',
+      alias_derivation: operation.aliasDerivation,
+      cause_bound_observation:
+        'strict delete throws or is impossible on the real nonconfigurable key property',
+      expected: 'full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O199-consumption_state-key-redefine': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'Derive exact state alias; redefine own property state.key with a different value/descriptor.',
+      alias_derivation: operation.aliasDerivation,
+      cause_bound_observation:
+        'defineProperty throws on the real nonconfigurable frozen key property',
+      expected: 'full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O200-consumption_state-key-reflect-set': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'Derive exact state alias; call Reflect.set(state, "key", attackerKey).',
+      alias_derivation: operation.aliasDerivation,
+      cause_bound_observation:
+        'Reflect.set returns exact false (not primitive TypeError); real key remains unchanged',
+      expected: 'return false and full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O201-consumption_state-status-set': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'Derive exact state alias; in strict mode assign a different valid status string to state.status.',
+      alias_derivation: operation.aliasDerivation,
+      cause_bound_observation:
+        'strict assignment throws or is impossible on the real frozen status property',
+      expected: 'full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O202-consumption_state-status-delete': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe: 'Derive exact state alias; in strict mode delete state.status.',
+      alias_derivation: operation.aliasDerivation,
+      cause_bound_observation:
+        'strict delete throws or is impossible on the real nonconfigurable status property',
+      expected: 'full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O203-consumption_state-status-redefine': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'Derive exact state alias; redefine own property state.status with a different value/descriptor.',
+      alias_derivation: operation.aliasDerivation,
+      cause_bound_observation:
+        'defineProperty throws on the real nonconfigurable frozen status property',
+      expected: 'full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O204-consumption_state-status-reflect-delete': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'Derive exact state alias; call Reflect.deleteProperty(state, "status").',
+      alias_derivation: operation.aliasDerivation,
+      cause_bound_observation:
+        'Reflect.deleteProperty returns exact false (not primitive TypeError); real status remains present/unchanged',
+      expected: 'return false and full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O205-decision-consumption_state-set': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'In strict mode assign a different object to exact own property decision.consumption_state.',
+      alias_derivation: null,
+      expected:
+        'throw or observably impossible; full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O206-decision-consumption_state-delete': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'In strict mode delete exact own property decision.consumption_state.',
+      alias_derivation: null,
+      expected:
+        'throw or observably impossible; full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O207-decision-consumption_state-redefine': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'In strict mode redefine exact own property descriptor decision.consumption_state with a different value/descriptor.',
+      alias_derivation: null,
+      expected:
+        'throw or observably impossible; full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O208-consumption_state-alias-setPrototypeOf': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'Derive `const state = decision.consumption_state`; assert it is the exact returned frozen state and nonaliased from caller state; then set its prototype.',
+      alias_derivation: operation.aliasDerivation,
+      expected:
+        'throw or observably impossible; full descriptor-graph before/after SHA-256 equal',
+    },
+    'X3-O209-consumption_state-alias-extend': {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      recipe:
+        'Derive `const state = decision.consumption_state`; assert exact returned frozen state/nonalias; then assign state.attacker_marker=true in strict mode.',
+      alias_derivation: operation.aliasDerivation,
+      expected:
+        'throw or observably impossible; full descriptor-graph before/after SHA-256 equal',
+    },
+  };
+  return (
+    detailed[operation.id] ?? {
+      id: operation.id,
+      target: operation.target,
+      operation: operation.operation,
+      expected: genericExpected,
+    }
+  );
+}
+
 describe('exact-target pure schema and attestation validator', () => {
   const x1Receipt = {
     caseResultsSha256: '',
@@ -726,6 +937,7 @@ describe('exact-target pure schema and attestation validator', () => {
   const x3Receipt = {
     callerPasses: 0,
     outputPasses: 0,
+    catalogSha256: '',
     mutationResultsSha256: '',
     graphEqual: 0,
     reflectFalse: 0,
@@ -1355,6 +1567,11 @@ describe('exact-target pure schema and attestation validator', () => {
     expect(sha256(ids.join('\n'))).toBe(
       '6700fabc5ad8a8e66a98c86bf8672f98dd9952e9a10d203e9922d4c99106f0ab',
     );
+    const catalog = operations.map(x3CatalogEntry);
+    x3Receipt.catalogSha256 = sha256(canonicalJson(catalog));
+    expect(x3Receipt.catalogSha256).toBe(
+      'd0a66a360d1c38375ceb5362f6c36ccee1957bab3869ad4a49415be443455442',
+    );
     expect(operations.slice(3).map(({ id, target, operation }) => ({ id, target, operation }))).toHaveLength(206);
     expect(operations.filter(({ aliasDerivation }) => aliasDerivation !== null)).toHaveLength(10);
     expect(operations.filter(({ reflectFalse }) => reflectFalse)).toHaveLength(2);
@@ -1526,8 +1743,7 @@ describe('exact-target pure schema and attestation validator', () => {
         x3_output_mutation_pass_count: x3Receipt.outputPasses,
         x3_output_mutation_ids_sha256:
           '6700fabc5ad8a8e66a98c86bf8672f98dd9952e9a10d203e9922d4c99106f0ab',
-        x3_output_mutation_catalog_sha256:
-          'd0a66a360d1c38375ceb5362f6c36ccee1957bab3869ad4a49415be443455442',
+        x3_output_mutation_catalog_sha256: x3Receipt.catalogSha256,
         x3_mutation_results_sha256: x3Receipt.mutationResultsSha256,
         x3_full_graph_before_after_equal_count: x3Receipt.graphEqual,
         x3_full_graph_before_after_mismatch_count: 0,
