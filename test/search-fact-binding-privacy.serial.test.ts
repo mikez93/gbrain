@@ -61,13 +61,17 @@ function fixtureSearchResult(): SearchResult {
   };
 }
 
+function isBindingSql(sql: string): boolean {
+  return sql.includes('binding_rank') && sql.includes('capture_page_slug');
+}
+
 async function expectOperatorOnly(
   run: (ctx: OperationContext) => Promise<SearchResult[]>,
 ): Promise<void> {
   const originalExecuteRaw = engine.executeRaw.bind(engine);
   let bindingSqlCalls = 0;
   engine.executeRaw = (async (sql: string, params?: unknown[]) => {
-    if (sql.includes('WITH refs(source_id, slug)')) bindingSqlCalls += 1;
+    if (isBindingSql(sql)) bindingSqlCalls += 1;
     return originalExecuteRaw(sql, params);
   }) as typeof engine.executeRaw;
   try {
@@ -94,7 +98,7 @@ async function expectOperatorOnly(
     // Binding-store failures omit the additive private coordinates while
     // preserving the already-authorized underlying search result.
     engine.executeRaw = (async (sql: string, params?: unknown[]) => {
-      if (sql.includes('WITH refs(source_id, slug)')) {
+      if (isBindingSql(sql)) {
         bindingSqlCalls += 1;
         throw new Error('fact-binding storage unavailable');
       }
