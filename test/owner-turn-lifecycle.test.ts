@@ -19,6 +19,10 @@ const JOBS_SOURCE = readFileSync(
   join(import.meta.dir, '..', 'src', 'commands', 'jobs.ts'),
   'utf8',
 );
+const CYCLE_SOURCE = readFileSync(
+  join(import.meta.dir, '..', 'src', 'core', 'cycle.ts'),
+  'utf8',
+);
 const HANDLER_SOURCE = readFileSync(
   join(import.meta.dir, '..', 'src', 'core', 'minions', 'handlers', 'owner-turn-lifecycle.ts'),
   'utf8',
@@ -154,6 +158,7 @@ describe('F4b owner-turn lifecycle wiring', () => {
     expect(HANDLER_SOURCE).toContain("engine.getConfig('models.chat')");
     expect(HANDLER_SOURCE).toContain('extractAtomsModel: configuredChatModel');
     expect(HANDLER_SOURCE).toContain('proposeTakesModel: configuredChatModel');
+    expect(CYCLE_SOURCE).toContain('{ model: opts.proposeTakesModel }');
     expect(HANDLER_SOURCE).not.toContain('drain');
     expect(HANDLER_SOURCE).not.toContain('listSources');
     expect(HANDLER_SOURCE).not.toContain('listPages');
