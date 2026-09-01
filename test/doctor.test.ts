@@ -735,6 +735,42 @@ describe('v0.32.4 — sync_freshness check', () => {
     expect(result.message).toContain('gbrain sync --source <id>');
   });
 
+  test('explicit virtual-proposal contract is exempt but session capture is not', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      {
+        id: 'proposals-inbox', name: '', local_path: '/tmp/proposals',
+        last_sync_at: null, config: { lifecycle_contract: 'virtual-proposal' },
+      },
+      {
+        id: 'agent-sessions', name: '', local_path: '/tmp/sessions',
+        last_sync_at: null, config: { lifecycle_contract: 'session-capture' },
+      },
+    ]));
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain(`'agent-sessions'`);
+    expect(result.message).not.toContain(`'proposals-inbox'`);
+    expect(result.details).toEqual({
+      unchanged_count: 0, synced_recently_count: 0, stale_count: 1,
+    });
+  });
+
+  test('all explicit virtual-proposal sources are a healthy lifecycle no-op', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      {
+        id: 'proposals-inbox', name: '', local_path: '/tmp/proposals',
+        last_sync_at: null, config: { lifecycle_contract: 'virtual-proposal' },
+      },
+    ]));
+    expect(result).toEqual({
+      name: 'sync_freshness',
+      status: 'ok',
+      message: 'No lifecycle-managed federated sources to sync',
+      details: { unchanged_count: 0, synced_recently_count: 0, stale_count: 0 },
+    });
+  });
+
   test('last_sync_at > 72h ago → fail with day-rounded "Nd ago"', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     const result = await checkSyncFreshness(makeStubEngine([
