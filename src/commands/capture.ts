@@ -60,6 +60,8 @@ interface RunOpts {
   source?: string;
   quiet?: boolean;
   json?: boolean;
+  /** Queue bounded atom/take processing for this exact Hermes turn page. */
+  ownerTurnLifecycle?: boolean;
   // v0.42.x — Life Chronicle (#2390): manual `--type event` frontmatter sugar.
   who?: string;    // comma-separated entity slugs
   what?: string;
@@ -76,6 +78,7 @@ function parseArgs(args: string[]): RunOpts | { help: true; positional: string |
     if (a === '--help' || a === '-h') return { help: true, positional: undefined };
     if (a === '--quiet' || a === '-q') { opts.quiet = true; continue; }
     if (a === '--json') { opts.json = true; continue; }
+    if (a === '--owner-turn-lifecycle') { opts.ownerTurnLifecycle = true; continue; }
     if (a === '--stdin') { opts.stdin = true; continue; }
     if (a === '--file') {
       const v = args[++i];
@@ -133,6 +136,9 @@ Options:
                        registration scopes the source).
   --quiet, -q          Print just the slug on stdout (for shell pipelines)
   --json               JSON output for agents
+  --owner-turn-lifecycle
+                       Queue atoms and take proposals for this exact canonical
+                       Hermes turn page. Local trusted capture only.
   --help, -h           Show this help
 
 Notes:
@@ -211,6 +217,8 @@ interface CaptureResult {
   path?: string;
   source_kind: string;
   captured_at: string;
+  owner_turn_lifecycle_job_id?: number;
+  owner_turn_lifecycle_state?: 'queued';
 }
 
 function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): void {
@@ -348,6 +356,10 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
   // through the wire (would be discarded server-side, and we don't want
   // to suggest the values reached the DB column when they didn't).
   if (isThinClient(cfg)) {
+    if (parsed.ownerTurnLifecycle) {
+      console.error('gbrain capture: --owner-turn-lifecycle requires a local engine');
+      process.exit(1);
+    }
     let raw: unknown;
     try {
       raw = await callRemoteTool(
@@ -446,6 +458,25 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       chunks?: number;
       write_through?: { written: boolean; path?: string; skipped?: string };
     };
+    let ownerTurnLifecycleJobId: number | undefined;
+    if (parsed.ownerTurnLifecycle) {
+      const page = await engine.getPage(result.slug, { sourceId: resolvedSourceId });
+      if (!page) {
+        throw new Error('captured page is unavailable for owner-turn lifecycle queueing');
+      }
+      const {
+        assertCanonicalOwnerTurnPage,
+        ownerTurnPageContentHash,
+        submitOwnerTurnLifecycle,
+      } = await import('../core/cycle/owner-turn-lifecycle.ts');
+      assertCanonicalOwnerTurnPage(resolvedSourceId, page);
+      const job = await submitOwnerTurnLifecycle(engine, {
+        sourceId: resolvedSourceId,
+        slug: result.slug,
+        pageContentHash: ownerTurnPageContentHash(page),
+      });
+      ownerTurnLifecycleJobId = job.id;
+    }
     printReceipt(
       {
         slug: result.slug,
@@ -457,6 +488,12 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
         // CV3: source_kind is the channel taxonomy, NOT the DB source FK.
         source_kind: 'capture-cli',
         captured_at: capturedAt,
+        ...(ownerTurnLifecycleJobId !== undefined
+          ? {
+              owner_turn_lifecycle_job_id: ownerTurnLifecycleJobId,
+              owner_turn_lifecycle_state: 'queued' as const,
+            }
+          : {}),
       },
       parsed.quiet ?? false,
       parsed.json ?? false,

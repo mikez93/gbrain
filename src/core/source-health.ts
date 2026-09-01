@@ -27,6 +27,23 @@ import { parseSourceConfig, type SourceRow } from './sources-load.ts';
 import { isSourceUnchangedSinceSync } from './git-head.ts';
 import { resolveHoursEnv } from './env-number.ts';
 
+/**
+ * A virtual proposal queue is written through DB operations, not reconciled
+ * from its registration checkout. Its source row still carries a local_path
+ * so ordinary source routing can resolve it, but sync/cycle freshness is not a
+ * meaningful lifecycle signal for that path. The explicit source-config
+ * contract keeps this exception narrow and fail-closed: absent, malformed, or
+ * differently named contracts remain subject to normal freshness checks.
+ */
+export function isVirtualProposalLifecycle(config: unknown): boolean {
+  return Boolean(
+    config
+      && typeof config === 'object'
+      && !Array.isArray(config)
+      && (config as Record<string, unknown>).lifecycle_contract === 'virtual-proposal',
+  );
+}
+
 export interface SourceMetrics {
   source_id: string;
   name: string;

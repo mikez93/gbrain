@@ -151,6 +151,8 @@ export interface ExtractAtomsOpts {
   sourceId?: string;
   dryRun?: boolean;
   affectedSlugs?: string[];
+  /** Explicit model binding for a trusted exact-page lifecycle job. */
+  model?: string;
   /** Test seam: alternative chat function (bypasses real LLM calls). */
   _chat?: typeof gatewayChat;
   /**
@@ -590,10 +592,12 @@ export async function runPhaseExtractAtoms(
   const failures: Array<{ source: string; error: string }> = [];
   let estimatedSpendUsd = 0;
   let budgetExhausted = false;
-  let extractModel = DEFAULT_EXTRACT_ATOMS_MODEL;
+  let extractModel = opts.model ?? DEFAULT_EXTRACT_ATOMS_MODEL;
   let budgetCap = DEFAULT_BUDGET_USD;
   try {
-    const configuredModel = await engine.getConfig('models.dream.extract_atoms');
+    const configuredModel = opts.model
+      ? null
+      : await engine.getConfig('models.dream.extract_atoms');
     if (configuredModel) extractModel = configuredModel;
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
     if (configuredBudget) {

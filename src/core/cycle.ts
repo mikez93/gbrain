@@ -529,6 +529,12 @@ export interface CycleOpts {
    * Validated via `assertValidSourceId` in `cycleLockIdFor` (defense-in-depth).
    */
   sourceId?: string;
+  /** Exact page batch for an internal event-driven source cycle. */
+  targetSlugs?: string[];
+  /** Internal trusted-job bypass for phase gates; never exposed by dream CLI. */
+  forcePhaseGates?: CyclePhase[];
+  /** Existing configured model bound to targeted atom extraction. */
+  extractAtomsModel?: string;
   /**
    * issue #2860 — one-shot per-invocation bypass of a phase's own
    * `dream.<phase>.enabled` / `cycle.<phase>.enabled` config gate. Wired
@@ -2328,18 +2334,8 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
-    // ── v0.41 T9: extract_atoms (per-source, pack-gated) ──────────
-    // Orchestrator-level pack gate: consults the active pack's `phases:`
-    // declaration. When the active pack does NOT declare extract_atoms
-    // (e.g. user is on gbrain-base or gbrain-investor), this phase is a
-    // no-op with reason='not_in_active_pack'. When the pack does declare
-    // it (gbrain-creator, gbrain-everything), dispatches to the
-    // extract-atoms.ts module (real body in T5; stub for now).
-    //
-    // borrow_from does NOT borrow phases — each pack declares phase
-    // participation explicitly. The packDeclaresPhase helper walks the
-    // resolved active pack's `phases:` list ONLY; not the extends chain
-    // or borrow_from targets.
+    // ── extract_atoms: per-source and active-pack gated; borrowed pack
+    // phases never count as local declarations. ────────────────────
     if (phases.includes('extract_atoms')) {
       checkAborted(cycleSignal);
       if (!engine) {
@@ -2350,12 +2346,11 @@ export async function runCycle(
           summary: 'no database connected',
           details: { reason: 'no_database' },
         });
-      } else if (!(await packDeclaresPhase(engine, 'extract_atoms'))) {
-        // issue #1678: the routine cycle skip stays cheap (no per-tick backlog
-        // count), but the detail is greppable — `pack_gated: true` lets the
-        // `extract_atoms_backlog` doctor check / log scrapers tell a
-        // deliberately-off phase apart from a phase that ran with no work. The
-        // backlog signal itself lives in doctor (one count, on demand).
+      } else if (
+        !(opts.forcePhaseGates?.includes('extract_atoms')) &&
+        !(await packDeclaresPhase(engine, 'extract_atoms'))
+      ) {
+        // Keep routine skips cheap; doctor owns the on-demand backlog count.
         phaseResults.push({
           phase: 'extract_atoms',
           status: 'skipped',
@@ -2370,18 +2365,20 @@ export async function runCycle(
         // v0.41.2.1 (D9 #5): union sync + synthesize affected slugs so the
         // incremental discovery path doesn't miss pages just-written by the
         // synthesize phase that ran earlier in the same cycle.
-        const xaAffectedSlugs =
+        const xaAffectedSlugs = opts.targetSlugs ?? (
           syncPagesAffected || synthesizeWrittenSlugs
             ? [
                 ...(syncPagesAffected ?? []),
                 ...(synthesizeWrittenSlugs ?? []),
               ]
-            : undefined;
+            : undefined
+        );
         const { result, duration_ms } = await racedTimePhase(() => runPhaseExtractAtoms(engine, {
           brainDir: brainDir ?? undefined,
           sourceId: xaSourceId,
           dryRun,
           affectedSlugs: xaAffectedSlugs,
+          ...(opts.extractAtomsModel ? { model: opts.extractAtomsModel } : {}),
           // v0.41.19.0 (T3): closure refreshes cycle lock + fires outer hook.
           yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase, onStolen),
           // v0.41.19.0 (T4): pass same reporter (not a child — cycle.ts
@@ -2580,16 +2577,8 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
-    // ── v0.36.1.0 calibration phases (propose_takes → grade_takes →
-    //    calibration_profile). These run AFTER consolidate so the proposal
-    //    LLM sees newly-promoted facts, AFTER any take resolutions made
-    //    earlier in the cycle, and BEFORE embed so the calibration
-    //    narrative is available for downstream surfaces.
-    //
-    //    The three phases construct an OperationContext on the fly. The
-    //    cycle is a trusted-workspace caller (operator CLI / autopilot
-    //    daemon), so `remote: false` is the correct trust tier. sourceId
-    //    is resolved via the same `resolveSourceForDir` helper sync uses.
+    // Calibration runs after consolidation and before embedding. The cycle is
+    // a trusted local caller; sourceId follows the same resolver as sync.
     if (phases.includes('propose_takes') ||
         phases.includes('grade_takes') ||
         phases.includes('calibration_profile')) {
@@ -2610,14 +2599,15 @@ export async function runCycle(
           checkAborted(cycleSignal);
           progress.start('cycle.propose_takes');
           const { runPhaseProposeTakes } = await import('./cycle/propose-takes.ts');
-          // gbrain#4168: thread the job's absolute deadline so the phase's
-          // clean partial-exit fires before the worker's kill switch (same
-          // literal shape as the patterns call above so the structural guard
-          // matches both).
-          // #4102: `once` bypasses the cycle.propose_takes.enabled off switch
-          // for `gbrain dream --phase propose_takes --once` (same semantics as
-          // conversation_facts_backfill / enrich_thin above).
-          const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, { repoPath: brainDir ?? undefined, deadlineAtMs: opts.deadlineAtMs ?? null, once: opts.onceForPhase === 'propose_takes' }) as Promise<PhaseResult>);
+          // Thread the job deadline; `once` bypasses only this phase's gate.
+          const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, {
+            repoPath: brainDir ?? undefined,
+            deadlineAtMs: opts.deadlineAtMs ?? null,
+            once: opts.onceForPhase === 'propose_takes' || opts.forcePhaseGates?.includes('propose_takes'),
+            ...(opts.targetSlugs !== undefined
+              ? { slugs: opts.targetSlugs, pageLimit: Math.max(1, opts.targetSlugs.length) }
+              : {}),
+          }) as Promise<PhaseResult>);
           result.duration_ms = duration_ms;
           phaseResults.push(result);
           progress.finish();

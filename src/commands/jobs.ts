@@ -108,7 +108,7 @@ const GATEWAY_REFRESH_JOB_NAMES = new Set([
   'patterns',
   'consolidate',
   'extract_facts',
-  'extract-atoms-drain',
+  'extract-atoms-drain', 'owner-turn-lifecycle',
   'embed-backfill',
   'extract-takes-from-pages',
   'embed-catch-up',
@@ -2581,11 +2581,11 @@ export async function registerBuiltinHandlers(
     }
     return { ...result, ...candidateMetadata };
   }));
-
+  const ownerTurnLifecycle = await import('../core/minions/handlers/owner-turn-lifecycle.ts');
+  registerBuiltinJob(worker, engine, 'owner-turn-lifecycle', ownerTurnLifecycle.makeOwnerTurnLifecycleHandler(engine));
   // Autopilot-cycle handler: delegates to runCycle. Shares the exact same
   // phase set and ordering as `gbrain dream` and autopilot's inline path —
   // one source of truth for what the brain does overnight.
-  //
   // Yields the event loop between phases so the worker's lock-renewal
   // timer (src/core/minions/worker.ts) can fire. Without this the v0.14
   // stall-death regression returns: long CPU-bound phases starve the

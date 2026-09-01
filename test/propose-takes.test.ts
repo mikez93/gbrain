@@ -61,7 +61,13 @@ function buildMockEngine(opts: {
       captured.push({ sql, params: params ?? [] });
       // Narrow candidate-page projection (replaces listPages in the phase).
       if (sql.includes('SELECT slug, source_id, compiled_truth')) {
-        return opts.pages.map((p) => ({
+        const slugFilter = sql.includes('p.slug = ANY')
+          ? (params ?? []).find((value) => Array.isArray(value)) as string[] | undefined
+          : undefined;
+        const pages = slugFilter
+          ? opts.pages.filter((page) => slugFilter.includes(page.slug))
+          : opts.pages;
+        return pages.map((p) => ({
           slug: p.slug,
           source_id: p.source_id,
           compiled_truth: p.compiled_truth,
@@ -336,6 +342,30 @@ describe('extractExistingTakesForDedup', () => {
 // ─── Phase integration ──────────────────────────────────────────────
 
 describe('runPhaseProposeTakes — phase integration', () => {
+  test('exact slug batch never scans an older unprocessed page', async () => {
+    const target = buildPage({ slug: 'daily/hermes/owner/turn-new', body: 'new turn' });
+    const historical = buildPage({ slug: 'daily/hermes/owner/turn-old', body: 'old turn' });
+    const { engine, captured } = buildMockEngine({ pages: [historical, target] });
+    const seen: string[] = [];
+    const extractor: ProposeTakesExtractor = async ({ pagePath }) => {
+      seen.push(pagePath);
+      return [];
+    };
+
+    const result = await runPhaseProposeTakes(buildCtx(engine), {
+      extractor,
+      slugs: [target.slug],
+      pageLimit: 1,
+    });
+
+    expect(result.status).toBe('ok');
+    expect(seen).toEqual([target.slug]);
+    const candidateQuery = captured.find(({ sql }) =>
+      sql.includes('SELECT slug, source_id, compiled_truth'));
+    expect(candidateQuery?.sql).toContain('p.slug = ANY');
+    expect(candidateQuery?.params).toContainEqual([target.slug]);
+  });
+
   test('happy path: scans pages, extracts proposals, writes via INSERT', async () => {
     const pages = [buildPage({ slug: 'wiki/concepts/network-effects', body: 'Marketplaces with cold-start liquidity always win.' })];
     const { engine, captured } = buildMockEngine({ pages });

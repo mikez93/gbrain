@@ -10,7 +10,11 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import { probeSourceGitState } from '../../../core/git-head.ts';
 // v0.41.32.0: remote staleness reads the stored newest_content_at column via
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
-import { lagFromContentMs, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
+import {
+  isVirtualProposalLifecycle,
+  lagFromContentMs,
+  resolveStalenessCeilingSeconds,
+} from '../../../core/source-health.ts';
 import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
 import { CHUNKER_VERSION } from '../../../core/chunkers/code.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../../../core/link-extraction.ts';
@@ -803,6 +807,7 @@ export async function checkSyncFreshness(
       last_commit: string | null;
       chunker_version: string | null;
       newest_content_at: Date | null;
+      config: Record<string, unknown> | null;
     };
     // v0.41.32.0: newest_content_at feeds the REMOTE (non-localOnly) lag so
     // doctorReportRemote never shells out to git on a DB-supplied local_path.
@@ -811,11 +816,11 @@ export async function checkSyncFreshness(
     let sources: FreshnessSourceRow[];
     try {
       sources = await engine.executeRaw<FreshnessSourceRow>(
-        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
+        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
       );
     } catch {
       sources = await engine.executeRaw<FreshnessSourceRow>(
-        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL`,
+        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config FROM sources WHERE local_path IS NOT NULL`,
       );
     }
 
@@ -827,6 +832,19 @@ export async function checkSyncFreshness(
         details: { unchanged_count: 0, synced_recently_count: 0, stale_count: 0 },
       };
     }
+
+    const lifecycleManagedSources = sources.filter(
+      (source) => !isVirtualProposalLifecycle(source.config),
+    );
+    if (lifecycleManagedSources.length === 0) {
+      return {
+        name: 'sync_freshness',
+        status: 'ok',
+        message: 'No lifecycle-managed federated sources to sync',
+        details: { unchanged_count: 0, synced_recently_count: 0, stale_count: 0 },
+      };
+    }
+    sources = lifecycleManagedSources;
 
     const warnHours = _resolveSyncFreshnessHours('GBRAIN_SYNC_FRESHNESS_WARN_HOURS', 24);
     const failHours = _resolveSyncFreshnessHours('GBRAIN_SYNC_FRESHNESS_FAIL_HOURS', 72);

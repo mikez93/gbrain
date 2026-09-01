@@ -43,6 +43,18 @@ async function seed(id: string, lastFullCycleAt?: string, opts: { local_path?: s
 }
 
 describe('doctor checkCycleFreshness', () => {
+  test('explicit virtual-proposal contract is exempt but session capture is not', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('proposals-inbox');
+    await engine.updateSourceConfig('proposals-inbox', { lifecycle_contract: 'virtual-proposal' });
+    await seed('agent-sessions');
+    await engine.updateSourceConfig('agent-sessions', { lifecycle_contract: 'session-capture' });
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('warn');
+    expect(result.message).toContain(`'agent-sessions'`);
+    expect(result.message).not.toContain(`'proposals-inbox'`);
+  });
+
   test('empty (no federated sources) returns ok', async () => {
     // resetPgliteState reseeds the default source with no local_path
     await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);

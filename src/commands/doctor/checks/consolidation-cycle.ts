@@ -6,6 +6,7 @@
  */
 import type { BrainEngine } from '../../../core/engine.ts';
 import { resolveHoursEnv } from '../../../core/env-number.ts';
+import { isVirtualProposalLifecycle } from '../../../core/source-health.ts';
 import type { Check } from '../../doctor.ts';
 
 /** Local alias; the shared warn-once memo lives in core so it can't fork per module. */
@@ -146,12 +147,17 @@ export async function checkCycleFreshness(
   opts?: { nowMs?: number },
 ): Promise<Check> {
   try {
-    const sources = await engine.listAllSources({ localPathOnly: true });
+    const registeredSources = await engine.listAllSources({ localPathOnly: true });
+    const sources = registeredSources.filter(
+      (source) => !isVirtualProposalLifecycle(source.config),
+    );
     if (sources.length === 0) {
       return {
         name: 'cycle_freshness',
         status: 'ok',
-        message: 'No federated sources to cycle',
+        message: registeredSources.length === 0
+          ? 'No federated sources to cycle'
+          : 'No lifecycle-managed federated sources to cycle',
       };
     }
 
@@ -234,4 +240,3 @@ export async function checkCycleFreshness(
     };
   }
 }
-
