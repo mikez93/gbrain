@@ -22,7 +22,7 @@ src/commands/extract-conversation-facts.ts	2045	ratchet	grown v0.46.x per-provid
 src/core/import-file.ts	2142	ratchet	grown v0.46.26.0 megawave: OCR budget + image import + embed-retry rewire (#3973 #3374)
 src/core/cycle/synthesize.ts	2792	ratchet	merged waves; grown v0.46.26.0 megawave + master rolling lease via shared throttled renewer
 src/commands/embed.ts	1896	ratchet	lowered v0.46.26.0: embedBatchWithBackoff + retry cluster peeled to core/embed-retry.ts (core/commands layering fix)
-src/core/types.ts	1963	ratchet	grown v0.46.28 fleet retrieval and downstream disposition response types
+src/core/types.ts	1969	ratchet	grown v0.46.28 F9 retrieval evidence response fields
 src/commands/skillpack.ts	1360	ratchet
 src/core/minions/queue.ts	2442	ratchet	grown #4078 + megawave probe-liveness unlatch (#4310) + master private-queue lifecycle: recovery classifier + monotonic lease
 src/commands/init.ts	1950	ratchet	grown v0.46.x keyless capability notices
