@@ -5,6 +5,7 @@ import {
   ownerTurnPageContentHash,
   parseOwnerTurnLifecycleIdentity,
 } from '../../cycle/owner-turn-lifecycle.ts';
+import { resolveAlias } from '../../model-config.ts';
 import { UnrecoverableError, type MinionHandler } from '../types.ts';
 
 const PHASES = [
@@ -18,6 +19,14 @@ export function isOwnerTurnPhaseComplete(result: PhaseResult): boolean {
     result.status === 'skipped' &&
     result.details.reason === 'no_work'
   );
+}
+
+export async function resolveOwnerTurnChatModel(engine: BrainEngine): Promise<string> {
+  const configuredChatModel = await engine.getConfig('models.chat');
+  if (!configuredChatModel) {
+    throw new UnrecoverableError('owner-turn-lifecycle models.chat is unavailable');
+  }
+  return resolveAlias(engine, configuredChatModel);
 }
 
 export function makeOwnerTurnLifecycleHandler(engine: BrainEngine): MinionHandler {
@@ -42,10 +51,7 @@ export function makeOwnerTurnLifecycleHandler(engine: BrainEngine): MinionHandle
       return { status: 'skipped', reason: 'page_superseded', source_id: identity.sourceId };
     }
 
-    const configuredChatModel = await engine.getConfig('models.chat');
-    if (!configuredChatModel) {
-      throw new UnrecoverableError('owner-turn-lifecycle models.chat is unavailable');
-    }
+    const configuredChatModel = await resolveOwnerTurnChatModel(engine);
     const report = await runCycle(engine, {
       brainDir: null,
       pull: false,

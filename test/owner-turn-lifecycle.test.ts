@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { __testing as captureTesting } from '../src/commands/capture.ts';
 import { CLI_FLAG_REGISTRY } from '../src/core/cli-flag-registry.generated.ts';
+import { probeChatModel } from '../src/core/ai/gateway.ts';
 import {
   OWNER_TURN_LIFECYCLE_PAYLOAD_VERSION,
   assertCanonicalOwnerTurnPage,
@@ -11,7 +12,10 @@ import {
   parseOwnerTurnLifecycleIdentity,
   submitOwnerTurnLifecycle,
 } from '../src/core/cycle/owner-turn-lifecycle.ts';
-import { isOwnerTurnPhaseComplete } from '../src/core/minions/handlers/owner-turn-lifecycle.ts';
+import {
+  isOwnerTurnPhaseComplete,
+  resolveOwnerTurnChatModel,
+} from '../src/core/minions/handlers/owner-turn-lifecycle.ts';
 import { isProtectedJobName } from '../src/core/minions/protected-names.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
@@ -156,12 +160,21 @@ describe('F4b owner-turn lifecycle wiring', () => {
     expect(HANDLER_SOURCE).toContain('targetSlugs: [identity.slug]');
     expect(HANDLER_SOURCE).toContain('forcePhaseGates: [...PHASES]');
     expect(HANDLER_SOURCE).toContain("engine.getConfig('models.chat')");
+    expect(HANDLER_SOURCE).toContain('resolveAlias(engine, configuredChatModel)');
     expect(HANDLER_SOURCE).toContain('extractAtomsModel: configuredChatModel');
     expect(HANDLER_SOURCE).toContain('proposeTakesModel: configuredChatModel');
     expect(CYCLE_SOURCE).toContain('{ model: opts.proposeTakesModel }');
     expect(HANDLER_SOURCE).not.toContain('drain');
     expect(HANDLER_SOURCE).not.toContain('listSources');
     expect(HANDLER_SOURCE).not.toContain('listPages');
+  });
+
+  test('resolves the configured chat alias before threading it to both phases', async () => {
+    await engine.setConfig('models.aliases.gbrain-production', 'openrouter:z-ai/glm-5.3-flash');
+    await engine.setConfig('models.chat', 'gbrain-production');
+    const resolved = await resolveOwnerTurnChatModel(engine);
+    expect(resolved).toBe('openrouter:z-ai/glm-5.3-flash');
+    expect(probeChatModel(resolved)).toEqual({ ok: true });
   });
 
   test('retry accepts only an already-complete atom page as benign no-work', () => {
