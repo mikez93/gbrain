@@ -240,8 +240,72 @@ describe('acceptTakeProposal', () => {
     });
     expect(Number(stamped.promoted_row_num)).toBe(result.row_num);
 
+    const [index] = await engine.executeRaw<{ chunks: number; matches: number }>(
+      `SELECT count(*)::int AS chunks,
+              count(*) FILTER (
+                WHERE cc.search_vector @@ plainto_tsquery('english', 'Promote me')
+              )::int AS matches
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.source_id = $1 AND p.slug = $2`,
+      ['tenant-a', result.page_slug],
+    );
+    expect(Number(index.chunks)).toBeGreaterThan(0);
+    expect(Number(index.matches)).toBeGreaterThan(0);
+    const searchable = await engine.searchKeyword('Promote me', {
+      sourceId: 'tenant-a',
+      limit: 10,
+    });
+    expect(searchable.map((hit) => hit.slug)).toContain(result.page_slug);
+
     const again = await acceptTakeProposal(engine, id, { actedBy: 'test', ...writeScope('tenant-a') });
     expect(again).toMatchObject({ ok: true, idempotent: true, row_num: result.row_num });
+  });
+
+  test('indexes every claim when several accepted proposals share one curation page', async () => {
+    const contentHash = createHash('sha256').update('two accepted claims on one page').digest('hex');
+    const firstClaim = 'First independent searchable claim';
+    const secondClaim = 'Second independent searchable claim';
+    const firstId = await insertProposal({
+      source_id: 'tenant-a', page_slug: 'topics/a', claim: firstClaim, content_hash: contentHash,
+    });
+    const secondId = await insertProposal({
+      source_id: 'tenant-a', page_slug: 'topics/a', claim: secondClaim, content_hash: contentHash,
+    });
+
+    const first = await acceptTakeProposal(engine, firstId, writeScope('tenant-a'));
+    const second = await acceptTakeProposal(engine, secondId, writeScope('tenant-a'));
+    expect(second.page_slug).toBe(first.page_slug);
+    expect(second.row_num).not.toBe(first.row_num);
+
+    for (const claim of [firstClaim, secondClaim]) {
+      const matches = await engine.searchKeyword(claim, { sourceId: 'tenant-a', limit: 10 });
+      expect(matches.map(hit => hit.slug)).toContain(first.page_slug);
+    }
+
+    const claimChunks = await engine.executeRaw<{ chunk_text: string }>(
+      `SELECT cc.chunk_text
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.source_id = $1 AND p.slug = $2
+          AND cc.chunk_text = ANY($3::text[])
+        ORDER BY cc.chunk_index`,
+      ['tenant-a', first.page_slug, [firstClaim, secondClaim]],
+    );
+    expect(claimChunks.map(chunk => chunk.chunk_text)).toEqual([firstClaim, secondClaim]);
+
+    const replayed = await acceptTakeProposal(engine, firstId, writeScope('tenant-a'));
+    expect(replayed.idempotent).toBe(true);
+    const afterReplay = await engine.executeRaw<{ chunk_text: string }>(
+      `SELECT cc.chunk_text
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.source_id = $1 AND p.slug = $2
+          AND cc.chunk_text = ANY($3::text[])
+        ORDER BY cc.chunk_index`,
+      ['tenant-a', first.page_slug, [firstClaim, secondClaim]],
+    );
+    expect(afterReplay.map(chunk => chunk.chunk_text)).toEqual([firstClaim, secondClaim]);
   });
 
   test('refuses out-of-scope source and out-of-allow-list holder', async () => {
@@ -379,6 +443,14 @@ describe('acceptTakeProposal', () => {
     expect(repaired.repaired).toBeGreaterThanOrEqual(1);
     expect((await engine.listTakes({ page_slug: accepted.page_slug, sourceId: 'tenant-b' })).map(t => t.claim))
       .toContain('Repair me automatically');
+    const [index] = await engine.executeRaw<{ chunks: number }>(
+      `SELECT count(*)::int AS chunks
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.source_id = $1 AND p.slug = $2`,
+      ['tenant-b', accepted.page_slug],
+    );
+    expect(Number(index.chunks)).toBeGreaterThan(0);
   });
 
   test('accepted ledger knowledge survives a database rollback to pre-acceptance state', async () => {

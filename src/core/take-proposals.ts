@@ -7,10 +7,12 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BrainEngine, TakeKind } from './engine.ts';
+import type { ChunkInput } from './types.ts';
 import { parseMarkdown, serializeMarkdown } from './markdown.ts';
 import { parseTakesFence, upsertTakeRow } from './takes-fence.ts';
 import { withPageLock } from './page-lock.ts';
 import { ensureGbrainHome } from './gbrain-home.ts';
+import { chunkText } from './chunkers/recursive.ts';
 
 /**
  * Caller scope for the proposal review surface. Mirrors `sourceScopeOpts`
@@ -459,7 +461,8 @@ async function mirrorCanonicalCurationToDb(
     throw new Error(`committed curation page is invalid: ${canonical.errors.map(error => error.code).join(', ')}`);
   }
   assertCurationFrontmatter(canonical.frontmatter, target.source_id, target.content_hash);
-  const canonicalTake = parseTakesFence(canonical.compiled_truth).takes.find(
+  const canonicalTakes = parseTakesFence(canonical.compiled_truth).takes;
+  const canonicalTake = canonicalTakes.find(
     row => row.rowNum === rowNum && row.source === provenance,
   );
   if (!canonicalTake || canonicalTake.claim !== target.claim_text) {
@@ -501,6 +504,43 @@ async function mirrorCanonicalCurationToDb(
       timeline: canonical.timeline,
       frontmatter: canonical.frontmatter,
     }, { sourceId: target.source_id });
+
+    // Accepted knowledge is an internal publication path, not a file-sync
+    // path. `putPage` deliberately mirrors only the page row, so without this
+    // explicit index write a promoted claim has no content_chunks row and is
+    // invisible to both lexical retrieval and the next bounded embedding pass.
+    // The generic markdown chunker intentionally stops at the Takes fence, so
+    // append one deterministic claim-bearing chunk for every row in the
+    // committed fence. A curation page can hold several accepted proposals;
+    // indexing only the proposal currently being replayed would make the last
+    // replay overwrite the other claims at the same chunk index.
+    // Keep the write in the same transaction as the accepted proposal stamp:
+    // an acceptance can never commit a canonical page that search cannot see.
+    const canonicalChunks: ChunkInput[] = [];
+    for (const chunk of chunkText(canonical.compiled_truth)) {
+      canonicalChunks.push({
+        chunk_index: canonicalChunks.length,
+        chunk_text: chunk.text,
+        chunk_source: 'compiled_truth',
+      });
+    }
+    for (const chunk of chunkText(canonical.timeline)) {
+      canonicalChunks.push({
+        chunk_index: canonicalChunks.length,
+        chunk_text: chunk.text,
+        chunk_source: 'timeline',
+      });
+    }
+    for (const take of canonicalTakes) {
+      canonicalChunks.push({
+        chunk_index: canonicalChunks.length,
+        chunk_text: take.claim,
+        chunk_source: 'compiled_truth',
+      });
+    }
+    if (canonicalChunks.length > 0) {
+      await tx.upsertChunks(curationSlug, canonicalChunks, { sourceId: target.source_id });
+    }
 
     const duplicates = await tx.executeRaw<{
       page_slug: string;
