@@ -135,6 +135,22 @@ describe('v0.41 T5: runPhaseExtractAtoms via stubbed chat', () => {
     expect(rows.length).toBe(2);
   });
 
+  test('trusted exact-page caller can bind the existing configured chat model', async () => {
+    const seenModels: Array<string | undefined> = [];
+    const chat = async (opts: ChatOpts): Promise<ChatResult> => {
+      seenModels.push(opts.model);
+      return stubChat('[]')(opts);
+    };
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath: '/owner-turn.txt', content: 'turn', contentHash: 'owner' }],
+      _pages: [],
+      _chat: chat as typeof import('../../src/core/ai/gateway.ts').chat,
+      model: 'deepseek:existing-production-model',
+    });
+    expect(result.status).toBe('ok');
+    expect(seenModels).toEqual(['deepseek:existing-production-model']);
+  });
+
   test('dry-run counts but does NOT write', async () => {
     const chat = stubChat(`[{"title":"x","atom_type":"insight","body":"b"}]`);
     const result = await runPhaseExtractAtoms(engine, {

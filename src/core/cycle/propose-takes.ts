@@ -160,6 +160,8 @@ export interface ProposeTakesOpts extends BasePhaseOpts {
   repoPath?: string;
   /** Limit pages processed in this cycle (for triage / quick smoke). Default: 100. */
   pageLimit?: number;
+  /** Exact page batch for event-driven owner-turn processing. */
+  slugs?: string[];
   /** Bounded page-level extractor concurrency. Default: 1. */
   concurrency?: number;
   /** Inject the LLM call for tests; production uses gateway.chat. */
@@ -246,6 +248,7 @@ async function listCandidatePages(
   scope: ScopedReadOpts,
   limit: number,
   promptVersion: string,
+  slugs?: string[],
 ): Promise<ProposeTakesPageRow[]> {
   const alreadyProcessed = `EXISTS (
        SELECT 1
@@ -268,6 +271,10 @@ async function listCandidatePages(
   } else if (scope.sourceId) {
     params.push(scope.sourceId);
     where.push(`p.source_id = $${params.length}`);
+  }
+  if (slugs !== undefined) {
+    params.push(slugs);
+    where.push(`p.slug = ANY($${params.length}::text[])`);
   }
   params.push(limit);
   return engine.executeRaw<ProposeTakesPageRow>(
@@ -791,7 +798,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
     }
 
     // Load pages eligible for proposal. Source-scoped per BaseCyclePhase.
-    const pages = await listCandidatePages(engine, scope, pageLimit, promptVersion);
+    const pages = await listCandidatePages(engine, scope, pageLimit, promptVersion, opts.slugs);
 
     if (opts.reporter) {
       opts.reporter.start('propose_takes.pages' as never, pages.length);
