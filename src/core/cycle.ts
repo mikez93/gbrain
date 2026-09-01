@@ -535,6 +535,8 @@ export interface CycleOpts {
   forcePhaseGates?: CyclePhase[];
   /** Existing configured model bound to targeted atom extraction. */
   extractAtomsModel?: string;
+  /** Existing configured model bound to targeted take proposals. */
+  proposeTakesModel?: string;
   /**
    * issue #2860 — one-shot per-invocation bypass of a phase's own
    * `dream.<phase>.enabled` / `cycle.<phase>.enabled` config gate. Wired
@@ -2604,6 +2606,7 @@ export async function runCycle(
             repoPath: brainDir ?? undefined,
             deadlineAtMs: opts.deadlineAtMs ?? null,
             once: opts.onceForPhase === 'propose_takes' || opts.forcePhaseGates?.includes('propose_takes'),
+            ...(opts.proposeTakesModel ? { model: opts.proposeTakesModel } : {}),
             ...(opts.targetSlugs !== undefined
               ? { slugs: opts.targetSlugs, pageLimit: Math.max(1, opts.targetSlugs.length) }
               : {}),

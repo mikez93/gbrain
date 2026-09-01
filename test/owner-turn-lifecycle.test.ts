@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { __testing as captureTesting } from '../src/commands/capture.ts';
+import { CLI_FLAG_REGISTRY } from '../src/core/cli-flag-registry.generated.ts';
 import {
   OWNER_TURN_LIFECYCLE_PAYLOAD_VERSION,
   assertCanonicalOwnerTurnPage,
@@ -132,6 +133,17 @@ describe('F4b owner-turn lifecycle wiring', () => {
     expect(parsed).toMatchObject({ ownerTurnLifecycle: true, source: 'ezra' });
   });
 
+  test('generated registry admits the flag and executable help reaches capture', () => {
+    expect(CLI_FLAG_REGISTRY.capture).toContain('--owner-turn-lifecycle');
+    const result = Bun.spawnSync(
+      ['bun', 'src/cli.ts', 'capture', '--owner-turn-lifecycle', '--help'],
+      { cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe' },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain('--owner-turn-lifecycle');
+    expect(result.stderr.toString()).not.toContain('unknown flag');
+  });
+
   test('job is protected and runs only the two exact-page phases', () => {
     expect(isProtectedJobName('owner-turn-lifecycle')).toBe(true);
     expect(JOBS_SOURCE).toContain("registerBuiltinJob(worker, engine, 'owner-turn-lifecycle'");
@@ -141,6 +153,7 @@ describe('F4b owner-turn lifecycle wiring', () => {
     expect(HANDLER_SOURCE).toContain('forcePhaseGates: [...PHASES]');
     expect(HANDLER_SOURCE).toContain("engine.getConfig('models.chat')");
     expect(HANDLER_SOURCE).toContain('extractAtomsModel: configuredChatModel');
+    expect(HANDLER_SOURCE).toContain('proposeTakesModel: configuredChatModel');
     expect(HANDLER_SOURCE).not.toContain('drain');
     expect(HANDLER_SOURCE).not.toContain('listSources');
     expect(HANDLER_SOURCE).not.toContain('listPages');

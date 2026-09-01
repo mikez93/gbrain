@@ -54,6 +54,7 @@ export function makeOwnerTurnLifecycleHandler(engine: BrainEngine): MinionHandle
       targetSlugs: [identity.slug],
       forcePhaseGates: [...PHASES],
       extractAtomsModel: configuredChatModel,
+      proposeTakesModel: configuredChatModel,
       signal: job.signal,
       deadlineAtMs: job.deadlineAtMs,
       privateQueueOwnerJobId: job.id,

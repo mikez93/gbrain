@@ -64,7 +64,7 @@ export const PROTECTED_JOB_NAMES: ReadonlySet<string> = new Set([
   // --allow-protected`) can insert it.
   'extract-atoms-drain',
   // F4b owner-turn lifecycle: one protected, source+page-scoped execution of
-  // conversation facts, atom extraction, and take proposals. Capture is the
+  // atom extraction and take proposals. Capture is the
   // only automatic submitter; OAuth/MCP callers cannot create inference work.
   'owner-turn-lifecycle',
 ]);
